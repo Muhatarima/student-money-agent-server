@@ -16,7 +16,7 @@ import pytest  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
 from sqlalchemy import pool  # noqa: E402
-from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -37,3 +37,12 @@ async def conn(migrated_db: None) -> AsyncIterator[AsyncConnection]:
         yield connection
         await connection.rollback()
     await engine.dispose()
+
+
+@pytest.fixture
+async def session(conn: AsyncConnection) -> AsyncIterator[AsyncSession]:
+    # A session inside the test's transaction: even session.commit() is undone afterwards
+    async with AsyncSession(
+        bind=conn, expire_on_commit=False, join_transaction_mode="create_savepoint"
+    ) as s:
+        yield s

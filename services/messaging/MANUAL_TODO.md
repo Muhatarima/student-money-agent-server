@@ -74,3 +74,23 @@ If two people use different keys, users can't be found.
 
 **How to check** `.venv\Scripts\python -c "from app.security import hash_phone; print(hash_phone('8801700001234')[:8])"`
 prints the same 8 characters on every teammate's machine.
+
+## 5. `INTERNAL_API_KEY`, `MONEY_URL`, `IDENTITY_URL` (now required)
+
+**What to do**
+1. Use the team's shared `INTERNAL_API_KEY` (one person generates it with
+   `python -c "import secrets; print(secrets.token_hex(32))"` and shares it privately).
+   It must be the SAME value in messaging, money and identity `.env` files.
+2. In `services\messaging\.env` set `INTERNAL_API_KEY=<value>`,
+   `MONEY_URL=http://localhost:8002`, `IDENTITY_URL=http://localhost:8003`.
+
+**Why** `app/clients.py` sends this key as `X-Internal-Key` on every call to B and C;
+they answer 401 without it. The app refuses to start if these are missing.
+
+**Affects** `.env`, `app/config.py`, `app/clients.py`.
+
+**How to check** Run the mocks (each in its own terminal, from `services\messaging`):
+`uvicorn tests.mocks.mock_money:app --port 8002` and
+`uvicorn tests.mocks.mock_identity:app --port 8003`, then
+`.venv\Scripts\python -c "import asyncio; from app.clients import MoneyClient; print(asyncio.run(MoneyClient().get_rate('BDT_IDR')))"`
+→ prints a rate of 135.20. (Stop the mocks before running Engineer B's real money service on 8002.)

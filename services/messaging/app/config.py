@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     redis_url: str
     phone_hash_key: SecretStr  # shared team secret, see MANUAL_TODO.md
 
+    # Other services (internal API). Every call sends X-Internal-Key.
+    internal_api_key: SecretStr
+    money_url: str
+    identity_url: str
+
     # WhatsApp Cloud API (sending). With WA_FAKE_SEND=true nothing is sent to Meta.
     wa_fake_send: bool = False
     wa_access_token: SecretStr = SecretStr("")

@@ -8,3 +8,4 @@ pytest
 pytest-asyncio
 fakeredis
 ruff
+-e ../../packages/contracts

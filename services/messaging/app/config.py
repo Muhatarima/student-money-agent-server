@@ -10,5 +10,11 @@ class Settings(BaseSettings):
     wa_app_secret: SecretStr
     redis_url: str
 
+    # WhatsApp Cloud API (sending). With WA_FAKE_SEND=true nothing is sent to Meta.
+    wa_fake_send: bool = False
+    wa_access_token: SecretStr = SecretStr("")
+    wa_phone_number_id: str = ""
+    wa_api_version: str = "v21.0"
+
 
 settings = Settings()

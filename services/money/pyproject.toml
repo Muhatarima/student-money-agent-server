@@ -14,3 +14,7 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.ruff.lint.isort]
 # Our alembic/ folder has the same name as the library; imports mean the library
 known-third-party = ["alembic"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's normal style: def route(session = Depends(get_session))
+extend-immutable-calls = ["fastapi.Depends"]

@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     fee_min_bdt: Decimal = Decimal("20")
 
     quote_ttl_seconds: int = 60
+
+    # MockProvider behaviour (probabilities 0.0-1.0, not money, so float is fine)
+    mock_failure_rate: float = 0.1
+    mock_timeout_rate: float = 0.1
     rate_stale_seconds: int = 120
 
     @property

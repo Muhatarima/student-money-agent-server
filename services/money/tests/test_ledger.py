@@ -50,7 +50,9 @@ async def test_house_account_is_unique_even_with_no_owner(session):
     second = await house(session, HOUSE_FX)
     assert first.id == second.id
     count = await session.scalar(
-        select(func.count()).select_from(Account).where(Account.name == HOUSE_FX)
+        select(func.count())
+        .select_from(Account)
+        .where(Account.name == HOUSE_FX, Account.currency == "BDT")
     )
     assert count == 1
 

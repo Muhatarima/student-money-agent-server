@@ -10,3 +10,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+# Our alembic/ folder has the same name as the library; imports mean the library
+known-third-party = ["alembic"]

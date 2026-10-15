@@ -1,5 +1,10 @@
 fastapi
 uvicorn[standard]
+pydantic-settings
 python-dotenv
 redis
 httpx
+pytest
+pytest-asyncio
+fakeredis
+ruff

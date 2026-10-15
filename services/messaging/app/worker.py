@@ -1,24 +1,13 @@
 import asyncio
 import json
-import os
 
-import redis.asyncio as redis
-from dotenv import load_dotenv
 from redis.exceptions import ConnectionError, TimeoutError
 
-load_dotenv()
-
-r = redis.from_url(
-    os.environ["REDIS_URL"],
-    decode_responses=True,
-    protocol=2,
-    socket_timeout=30,          # connection waits up to 30s...
-    health_check_interval=15,   # ...and checks itself every 15s
-)
+from app.redis_client import redis as r
 
 QUEUE = "queue:incoming"
 PROCESSING = "queue:processing"
-BLOCK_SECONDS = 20              # ...but each job-wait is only 20s (less than 30)
+BLOCK_SECONDS = 20  # must stay below the client's socket_timeout (30s)
 
 
 async def handle(job: dict) -> None:
@@ -33,8 +22,7 @@ async def main() -> None:
     while True:
         try:
             # Atomically move one job from QUEUE to PROCESSING
-            raw = await r.blmove(QUEUE, PROCESSING, timeout=BLOCK_SECONDS,
-                                 src="RIGHT", dest="LEFT")
+            raw = await r.blmove(QUEUE, PROCESSING, timeout=BLOCK_SECONDS, src="RIGHT", dest="LEFT")
         except (TimeoutError, ConnectionError) as e:
             print(f"🔌 Redis hiccup ({type(e).__name__}), retrying in 2s...")
             await asyncio.sleep(2)

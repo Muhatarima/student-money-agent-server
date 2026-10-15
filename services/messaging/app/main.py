@@ -1,19 +1,12 @@
 import hashlib
 import hmac
 import json
-import os
 
-import redis.asyncio as redis
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
-load_dotenv()  # reads .env into environment variables
-
-VERIFY_TOKEN = os.environ["WA_VERIFY_TOKEN"]
-APP_SECRET = os.environ["WA_APP_SECRET"].encode()  # hmac needs bytes
-
-r = redis.from_url(os.environ["REDIS_URL"], decode_responses=True, protocol=2)
+from app.config import settings
+from app.redis_client import redis as r
 
 QUEUE = "queue:incoming"
 
@@ -65,7 +58,8 @@ def verify_webhook(
     challenge: str = Query(alias="hub.challenge"),
 ):
     # compare_digest = constant-time compare (stops timing attacks)
-    if mode == "subscribe" and hmac.compare_digest(token, VERIFY_TOKEN):
+    verify_token = settings.wa_verify_token.get_secret_value()
+    if mode == "subscribe" and hmac.compare_digest(token, verify_token):
         return PlainTextResponse(challenge)  # echo back = "yes, this URL is mine"
     raise HTTPException(status_code=403, detail="Verification failed")
 
@@ -75,7 +69,8 @@ def verify_webhook(
 async def receive_webhook(request: Request):
     raw_body = await request.body()  # exact bytes, before any parsing
     received_sig = request.headers.get("X-Hub-Signature-256", "")
-    expected_sig = "sha256=" + hmac.new(APP_SECRET, raw_body, hashlib.sha256).hexdigest()
+    app_secret = settings.wa_app_secret.get_secret_value().encode()  # hmac needs bytes
+    expected_sig = "sha256=" + hmac.new(app_secret, raw_body, hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(received_sig, expected_sig):
         raise HTTPException(status_code=401, detail="Bad signature")

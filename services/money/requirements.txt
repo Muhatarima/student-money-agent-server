@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+sqlalchemy[asyncio]
+asyncpg
+alembic
+redis
+httpx
+pytest
+pytest-asyncio
+pytest-cov
+fakeredis
+ruff
+aiosqlite
+-e ../../packages/contracts

@@ -71,7 +71,9 @@ async def advance(
     return transfer
 
 
-async def create_transfer(session: AsyncSession, proposal: TransferProposal) -> Transfer:
+async def create_transfer(
+    session: AsyncSession, proposal: TransferProposal, mandate_id: uuid.UUID | None = None
+) -> Transfer:
     """Create the transfer, or return the existing one if this idempotency key was seen before.
     The caller commits."""
     values = {
@@ -80,6 +82,7 @@ async def create_transfer(session: AsyncSession, proposal: TransferProposal) -> 
         "to_currency": proposal.to_currency.value,
         "amount": proposal.amount,
         "recipient_id": proposal.recipient_id,
+        "mandate_id": mandate_id,
     }
     # ON CONFLICT DO NOTHING: if 20 calls race, Postgres lets exactly one insert win
     await session.execute(

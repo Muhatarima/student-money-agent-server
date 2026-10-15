@@ -73,6 +73,53 @@ async def recipient_cooling(session: AsyncSession, transfer: Transfer) -> bool:
     return recipient.cooling_until > datetime.now(UTC)
 
 
+async def spent_this_month_bdt(session: AsyncSession, redis: Redis, transfer: Transfer) -> Decimal:
+    """What this transfer's rule already converted this month (UTC), not counting this one."""
+    month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    total = await session.scalar(
+        select(func.coalesce(func.sum(Transfer.amount), 0)).where(
+            Transfer.mandate_id == transfer.mandate_id,
+            Transfer.id != transfer.id,
+            Transfer.created_at >= month_start,
+            Transfer.state.not_in([S.EXPIRED, S.FAILED]),
+        )
+    )
+    return await to_bdt(redis, transfer.from_currency, Decimal(total))
+
+
+async def build_context(
+    session: AsyncSession,
+    redis: Redis,
+    transfer: Transfer,
+    quote: Quote,
+    mandate: Mandate | None = None,
+) -> PolicyContext:
+    """Collect every fact the policy engine needs. Raises RateStale."""
+    now = datetime.now(UTC)
+    rate = await get_rate(redis, quote.pair)
+    ctx = PolicyContext(
+        user_frozen=await session.get(Freeze, transfer.user_id) is not None,
+        amount_bdt=await to_bdt(redis, transfer.from_currency, transfer.amount),
+        spent_today_bdt=await spent_today_bdt(session, redis, transfer),
+        spent_this_month_for_mandate=None,
+        mandate_max_per_month=None,
+        rate_age_seconds=int((now - rate.fetched_at).total_seconds()),
+        quote_expires_in_seconds=int((quote.expires_at - now).total_seconds()),
+        recipient_cooling_active=await recipient_cooling(session, transfer),
+        mandate_active=None,
+        mandate_valid_until_passed=None,
+        currency_pair_supported=quote.pair in PAIRS,
+    )
+    if mandate is not None:
+        ctx.mandate_active = mandate.state == MandateState.ACTIVE
+        ctx.mandate_valid_until_passed = mandate.valid_until <= now
+        ctx.spent_this_month_for_mandate = await spent_this_month_bdt(session, redis, transfer)
+        ctx.mandate_max_per_month = await to_bdt(
+            redis, mandate.from_currency, mandate.max_per_month
+        )
+    return ctx
+
+
 async def propose_transfer(
     session: AsyncSession, redis: Redis, proposal: TransferProposal
 ) -> ProposalResult:
@@ -94,20 +141,7 @@ async def propose_transfer(
         return rejected("pair_not_supported", transfer.id)
     try:
         quote = await create_quote(session, redis, pair, transfer.amount)
-        rate = await get_rate(redis, pair)
-        ctx = PolicyContext(
-            user_frozen=await session.get(Freeze, transfer.user_id) is not None,
-            amount_bdt=await to_bdt(redis, transfer.from_currency, transfer.amount),
-            spent_today_bdt=await spent_today_bdt(session, redis, transfer),
-            spent_this_month_for_mandate=None,
-            mandate_max_per_month=None,
-            rate_age_seconds=int((datetime.now(UTC) - rate.fetched_at).total_seconds()),
-            quote_expires_in_seconds=int((quote.expires_at - datetime.now(UTC)).total_seconds()),
-            recipient_cooling_active=await recipient_cooling(session, transfer),
-            mandate_active=None,
-            mandate_valid_until_passed=None,
-            currency_pair_supported=True,
-        )
+        ctx = await build_context(session, redis, transfer, quote)
     except RateStale:
         await session.commit()  # transfer stays CREATED; a retry tries again
         return rejected("rate_unavailable", transfer.id)

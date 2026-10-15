@@ -23,6 +23,7 @@ from app.ledger import get_balance, seed_user_funds
 from app.models import Mandate
 from app.providers.mock import MockProvider
 from app.redis_client import redis
+from app.rules_engine import freeze_user, index_rule
 
 app = FastAPI(title="Money Core")
 internal = [Depends(require_internal_key)]
@@ -91,7 +92,15 @@ async def approval_confirmed(
         raise HTTPException(e.status_code, e.detail) from None
     if kind == "transfer":
         background.add_task(run_transfer, confirmed.subject_id)
+    else:
+        await index_rule(redis, await session.get(Mandate, confirmed.subject_id))
     return {"ok": True}
+
+
+@app.post("/internal/users/{user_id}/freeze-money", dependencies=internal)
+async def freeze_money(user_id: uuid.UUID, session: AsyncSession = Depends(get_session)):
+    await freeze_user(session, redis, user_id)
+    return {"frozen": True}
 
 
 async def run_transfer(transfer_id: uuid.UUID) -> None:

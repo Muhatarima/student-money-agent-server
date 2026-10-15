@@ -306,7 +306,7 @@ def rule_body(user_id, **changes):
     } | changes
 
 
-async def test_rule_proposal_then_confirm_activates(client, identity):
+async def test_rule_proposal_then_confirm_activates(client, identity, redis):
     user_id = uuid.uuid4()
     result = (await client.post("/internal/proposals/rule", json=rule_body(user_id))).json()
     assert result["status"] == "pending_approval"
@@ -314,6 +314,7 @@ async def test_rule_proposal_then_confirm_activates(client, identity):
 
     body = confirm_body(identity, result["subject_id"])
     assert (await client.post("/internal/approvals/confirmed", json=body)).status_code == 200
+    assert await redis.zscore("rules:BDT_IDR", result["subject_id"]) == 136.0  # indexed
     rules = (await client.get(f"/internal/rules/{user_id}")).json()
     assert [(r["pair"], D(r["target_rate"]), r["status"]) for r in rules] == [
         ("BDT_IDR", D("136"), "active")
@@ -369,6 +370,7 @@ async def test_bad_rule_is_rejected(client, changes, reason):
         ("POST", "/internal/proposals/rule"),
         ("POST", "/internal/approvals/confirmed"),
         ("POST", f"/dev/seed/{uuid.uuid4()}"),
+        ("POST", f"/internal/users/{uuid.uuid4()}/freeze-money"),
     ],
 )
 @pytest.mark.parametrize("key", [None, "wrong-key"])
@@ -377,3 +379,10 @@ async def test_internal_routes_need_the_key(client, method, path, key):
     client.headers.pop("X-Internal-Key", None)
     response = await client.request(method, path, headers=headers, json={})
     assert response.status_code == 401
+
+
+async def test_freeze_money_route(client, session):
+    user_id = uuid.uuid4()
+    response = await client.post(f"/internal/users/{user_id}/freeze-money")
+    assert response.json() == {"frozen": True}
+    assert await session.get(Freeze, user_id) is not None

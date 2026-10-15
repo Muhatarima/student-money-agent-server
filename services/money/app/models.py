@@ -168,6 +168,8 @@ class Transfer(IdMixin, Base):
     amount: Mapped[Decimal]
     quote_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("quotes.id"))
     mandate_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("mandates.id"))
+    # None = the user's own wallet
+    recipient_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("recipients.id"))
     state: Mapped[TransferState] = mapped_column(
         str_enum(TransferState), default=TransferState.CREATED
     )

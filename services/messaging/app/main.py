@@ -6,21 +6,13 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from app.config import settings
-from app.redis_client import redis as r
-
-QUEUE = "queue:incoming"
+from app.dedupe import forget, is_duplicate
+from app.queue import enqueue_incoming
 
 app = FastAPI(title="Student Money Agent")
 
 
 # ---------- helpers ----------
-async def is_duplicate(msg_id: str) -> bool:
-    # nx=True: only set if the key doesn't exist yet (atomic check-and-save)
-    # ex=86400: Redis forgets the ID after 24 hours
-    was_new = await r.set(f"wa:msg:{msg_id}", "1", nx=True, ex=86400)
-    return not was_new
-
-
 def extract_messages(data: dict) -> list[dict]:
     # WhatsApp nests messages: entry -> changes -> value -> messages
     messages = []
@@ -37,10 +29,10 @@ async def enqueue_message(msg: dict) -> None:
         "text": msg.get("text", {}).get("body", ""),
     }
     try:
-        await r.lpush(QUEUE, json.dumps(job))  # add to the queue
+        await enqueue_incoming(job)
     except Exception:
         # If queuing fails, forget the ID so Meta's retry is NOT treated as a duplicate
-        await r.delete(f"wa:msg:{msg['id']}")
+        await forget(msg["id"])
         raise  # -> 500 -> Meta retries later
 
 

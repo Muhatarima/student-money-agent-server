@@ -8,6 +8,7 @@ from fastapi.responses import PlainTextResponse
 from app.config import settings
 from app.dedupe import forget, is_duplicate
 from app.queue import enqueue_incoming
+from app.security import mask_phone
 
 app = FastAPI(title="Student Money Agent")
 
@@ -77,8 +78,7 @@ async def receive_webhook(request: Request):
             continue
         new_count += 1
         await enqueue_message(msg)
-        sender = "****" + msg.get("from", "")[-4:]  # never log full phone numbers
-        print(f"📥 Queued message from {sender}")
+        print(f"📥 Queued message from {mask_phone(msg.get('from', ''))}")
 
     # Always answer 200 for genuine messages, even duplicates,
     # otherwise Meta keeps retrying.

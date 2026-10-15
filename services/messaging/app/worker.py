@@ -5,14 +5,15 @@ from redis.exceptions import ConnectionError, TimeoutError
 
 from app.queue import DEAD, INCOMING, PROCESSING
 from app.redis_client import redis as r
+from app.security import mask_phone
 
 BLOCK_SECONDS = 20  # must stay below the client's socket_timeout (30s)
 MAX_FAILURES = 3
 
 
 async def handle(job: dict) -> None:
-    sender = "****" + job["from"][-4:]
-    print(f"⚙️  Processing {job['msg_id']} from {sender}")  # never log the message text
+    # Never log the message text or the full phone number
+    print(f"⚙️  Processing {job['msg_id']} from {mask_phone(job['from'])}")
     await asyncio.sleep(2)  # pretend this is slow AI work
     print(f"✅ Done: {job['msg_id']}")
 

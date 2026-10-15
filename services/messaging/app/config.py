@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     wa_verify_token: SecretStr
     wa_app_secret: SecretStr
     redis_url: str
+    phone_hash_key: SecretStr  # shared team secret, see MANUAL_TODO.md
 
     # WhatsApp Cloud API (sending). With WA_FAKE_SEND=true nothing is sent to Meta.
     wa_fake_send: bool = False

@@ -5,6 +5,7 @@ import asyncio
 import httpx
 
 from app.config import settings
+from app.security import mask_phone
 
 MAX_ATTEMPTS = 3
 # Tests point this at a fake Meta; None = real network
@@ -36,7 +37,7 @@ async def _send(to: str, message: dict) -> None:
     payload = {"messaging_product": "whatsapp", "to": to} | message
     if settings.wa_fake_send:
         fake_outbox.append(payload)
-        print(f"📤 [fake send] {message['type']} to ****{to[-4:]}")
+        print(f"📤 [fake send] {message['type']} to {mask_phone(to)}")
         return
 
     token = settings.wa_access_token.get_secret_value()

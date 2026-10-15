@@ -56,3 +56,21 @@ In real mode with no token it refuses to send (fail closed).
 
 **How to check** Meta says "Verified", and sending "hello" from your phone shows
 `📥 Queued message from ****1234` in the API terminal.
+
+## 4. `PHONE_HASH_KEY` (shared team secret, now required)
+
+**What to do**
+1. ONE person on the team generates it once:
+   `python -c "import secrets; print(secrets.token_hex(32))"`
+2. Share it privately (password manager), not in git or group chats.
+3. Put it in `services\messaging\.env` as `PHONE_HASH_KEY=<value>`.
+   Engineer C uses the same value (handbook section 5).
+
+**Why** `app/security.py hash_phone()` turns phone numbers into HMAC hashes, so we
+never store or send raw phones. Without the key the app refuses to start.
+If two people use different keys, users can't be found.
+
+**Affects** `.env` (`PHONE_HASH_KEY`), `app/config.py`, `app/security.py`.
+
+**How to check** `.venv\Scripts\python -c "from app.security import hash_phone; print(hash_phone('8801700001234')[:8])"`
+prints the same 8 characters on every teammate's machine.

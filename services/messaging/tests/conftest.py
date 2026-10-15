@@ -4,6 +4,7 @@ import os
 os.environ["WA_VERIFY_TOKEN"] = "test-verify-token"
 os.environ["WA_APP_SECRET"] = "test-app-secret"
 os.environ["REDIS_URL"] = "redis://localhost:6379/15"
+os.environ["PHONE_HASH_KEY"] = "test-phone-hash-key"
 
 import fakeredis  # noqa: E402
 import pytest  # noqa: E402

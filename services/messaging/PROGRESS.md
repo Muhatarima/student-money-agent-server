@@ -1,6 +1,7 @@
 # Messaging (Engineer A): autonomous session progress
 
 Branch: `a-day1-autonomous` (main untouched). Date: 2026-10-15.
+**Not pushed yet**: GitHub refused the push (403, no write access). See `MANUAL_TODO.md` item 6.
 
 ## Finished (one commit each, tests passing at every commit)
 

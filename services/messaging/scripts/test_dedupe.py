@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 SECRET = os.environ["WA_APP_SECRET"].encode()
-URL = "http://127.0.0.1:8000/webhook"
+URL = "http://127.0.0.1:8001/webhook"
 
 msg_id = f"wamid.TEST-{uuid.uuid4().hex[:8]}"  # fresh ID each run
 

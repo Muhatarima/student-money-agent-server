@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 SECRET = os.environ["WA_APP_SECRET"].encode()
-URL = "http://127.0.0.1:8000/webhook"
+URL = "http://127.0.0.1:8001/webhook"
 
 body = json.dumps({"object": "whatsapp_business_account", "entry": []}).encode()
 good_sig = "sha256=" + hmac.new(SECRET, body, hashlib.sha256).hexdigest()

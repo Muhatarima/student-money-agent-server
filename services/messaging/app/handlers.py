@@ -52,12 +52,13 @@ async def _handle(job: dict, sender: str) -> None:
         link = await agent.identity.create_link_token(phone_hash, wa_id=sender)
         await whatsapp.send_link_button(sender, WELCOME, "Secure my account", link.url)
         return
-    if user.frozen:
-        await whatsapp.send_text(sender, FROZEN)
-        return
-
     # Button taps and the FREEZE / UPLOAD words: plain code, no LLM
     command = job["button_id"] or job["text"].strip().lower()
+    # FREEZE still runs when already frozen: it is safe to repeat, and it finishes a freeze
+    # where Identity worked but Money failed (fail closed)
+    if user.frozen and command != "freeze":
+        await whatsapp.send_text(sender, FROZEN)
+        return
     if job["type"] not in ACCEPTED_TYPES or command == "upload":
         # Photos, documents, audio...: never downloaded or stored here
         url = await agent.identity.create_upload_link(user.user_id)

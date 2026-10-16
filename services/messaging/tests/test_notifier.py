@@ -60,7 +60,6 @@ SETTLED = {
         ("rule_skipped", {"rule_id": "r1", "reason": "RateStale"}, "fresh rate"),
         ("rule_paused", {"rule_id": "r1"}, "paused"),
         ("account_linked", {}, "passkey"),
-        ("frozen", {}, "frozen"),
     ],
 )
 async def test_event_becomes_a_whatsapp_message(type_, data, expected):
@@ -68,6 +67,16 @@ async def test_event_becomes_a_whatsapp_message(type_, data, expected):
     assert await notifier.run_once(block_ms=None)
     assert expected in sent_text()
     assert await pending_count() == 0  # acked
+
+
+async def test_frozen_event_is_acked_without_a_message():
+    # Identity AND Money both publish "frozen"; the handler already confirmed the freeze
+    # to the user, so the notifier must not send anything (one FREEZE = one message)
+    await publish("frozen")
+    await publish("frozen")
+    assert await notifier.run_once(block_ms=None)
+    assert whatsapp.fake_outbox == []
+    assert await pending_count() == 0
 
 
 async def test_several_reasons_are_all_shown():
@@ -115,7 +124,7 @@ async def test_failed_send_is_not_acked_and_retried(monkeypatch):
         await real_send(to, text)
 
     monkeypatch.setattr(whatsapp, "send_text", flaky)
-    await publish("frozen")
+    await publish("account_linked")
     assert not await notifier.run_once(block_ms=None)
     assert await pending_count() == 1  # not acked: the send didn't happen
     assert await notifier.run_once(block_ms=None)  # retried from the pending list
@@ -128,12 +137,12 @@ async def test_third_failure_goes_to_dead_list(monkeypatch):
         raise RuntimeError("Meta down")
 
     monkeypatch.setattr(whatsapp, "send_text", broken)
-    await publish("frozen")
+    await publish("account_linked")
     for _ in range(3):
         assert not await notifier.run_once(block_ms=None)
     assert await pending_count() == 0  # not stuck forever
     [dead] = await notifier.redis.lrange(notifier.DEAD, 0, -1)
-    assert '"frozen"' in json.loads(dead)["data"]
+    assert '"account_linked"' in json.loads(dead)["data"]
 
 
 async def test_identity_down_is_retried_later(monkeypatch):
@@ -141,7 +150,7 @@ async def test_identity_down_is_retried_later(monkeypatch):
         raise ServiceUnavailable("identity unreachable")
 
     monkeypatch.setattr(notifier.identity, "get_wa_target", down)
-    await publish("frozen")
+    await publish("account_linked")
     assert not await notifier.run_once(block_ms=None)
     assert await pending_count() == 1
 

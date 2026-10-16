@@ -131,3 +131,35 @@ async def test_enqueue_failure_forgets_dedupe_key(client, redis, monkeypatch):
     monkeypatch.undo()
     response = await post_signed(client, message_payload(msg_id="wamid.FAIL"))
     assert response.json()["new"] == 1
+
+
+# --- Day 4: health + body size ---
+
+
+async def test_health_ok(client):
+    response = await client.get("/health")
+    assert response.status_code == 200 and response.json() == {"status": "ok"}
+
+
+async def test_health_503_when_redis_is_down(client, monkeypatch):
+    async def down():
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(main.redis, "ping", down)
+    response = await client.get("/health")
+    assert response.status_code == 503
+
+
+async def test_body_over_1mb_is_413(client, redis):
+    body = b"x" * (main.MAX_BODY_BYTES + 1)
+    response = await post_signed(client, body)
+    assert response.status_code == 413
+    assert await redis.llen("queue:incoming") == 0
+
+
+async def test_body_over_1mb_without_content_length_is_413(client):
+    async def chunks():
+        yield b"x" * (main.MAX_BODY_BYTES + 1)
+
+    response = await client.post("/webhook", content=chunks())
+    assert response.status_code == 413

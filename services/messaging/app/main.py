@@ -4,18 +4,21 @@ import json
 import logging
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.config import settings
 from app.dedupe import forget, is_duplicate
 from app.logs import setup_logging
 from app.queue import enqueue_incoming
+from app.redis_client import redis
 from app.security import mask_phone
 
 setup_logging()
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="Student Money Agent")
+
+MAX_BODY_BYTES = 1_000_000  # real WhatsApp webhooks are a few KB
 
 
 # ---------- helpers ----------
@@ -47,7 +50,12 @@ async def enqueue_message(msg: dict) -> None:
 
 # ---------- routes ----------
 @app.get("/health")
-def health():
+async def health():
+    # Without Redis we can't queue messages, so report unhealthy
+    try:
+        await redis.ping()
+    except Exception:
+        return JSONResponse({"status": "redis_unavailable"}, status_code=503)
     return {"status": "ok"}
 
 
@@ -68,7 +76,11 @@ def verify_webhook(
 # ---- Lock 2: signature check + duplicate blocking + queue ----
 @app.post("/webhook")
 async def receive_webhook(request: Request):
+    if int(request.headers.get("content-length") or 0) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Body too large")
     raw_body = await request.body()  # exact bytes, before any parsing
+    if len(raw_body) > MAX_BODY_BYTES:  # no content-length header (chunked upload)
+        raise HTTPException(status_code=413, detail="Body too large")
     received_sig = request.headers.get("X-Hub-Signature-256", "")
     app_secret = settings.wa_app_secret.get_secret_value().encode()  # hmac needs bytes
     expected_sig = "sha256=" + hmac.new(app_secret, raw_body, hashlib.sha256).hexdigest()

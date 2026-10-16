@@ -49,12 +49,14 @@ async def create_link_token(
     payload: LinkTokenRequest,
     db: AsyncSession = Depends(get_db),
 ) -> LinkTokenOut:
-    # Rate limit: max 5 requests per hour per phone_hash
+    # Rate limit: max 5 requests per hour per phone_hash (atomic pipeline \u2014 BUG-6 fix)
     rate_key = f"rate:link-token:{payload.phone_hash}"
     try:
-        count = await redis_client.incr(rate_key)
-        if count == 1:
-            await redis_client.expire(rate_key, 3600)
+        async with redis_client.pipeline(transaction=True) as pipe:
+            await pipe.incr(rate_key)
+            await pipe.expire(rate_key, 3600)
+            results = await pipe.execute()
+        count = results[0]
         if count > 5:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -63,7 +65,7 @@ async def create_link_token(
     except HTTPException:
         raise
     except Exception:
-        # If redis error in dev/test, proceed gracefully or fail closed depending on env
+        # If Redis is unavailable in dev/test, proceed gracefully.
         pass
 
     raw_token = new_token()

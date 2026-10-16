@@ -6,9 +6,16 @@ from cryptography.fernet import Fernet
 
 from .config import settings
 
+# ISSUE-10 fix: lazily cached Fernet instance — key is parsed and validated once
+# per process lifetime rather than on every encrypt/decrypt call.
+_fernet: Fernet | None = None
+
 
 def _get_fernet() -> Fernet:
-    return Fernet(settings.FERNET_KEY.encode("utf-8"))
+    global _fernet
+    if _fernet is None:
+        _fernet = Fernet(settings.FERNET_KEY.encode("utf-8"))
+    return _fernet
 
 
 def encrypt_str(plaintext: str) -> str:
@@ -38,4 +45,3 @@ def ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt
-

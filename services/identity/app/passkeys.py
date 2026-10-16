@@ -53,9 +53,13 @@ def _check_origin(origin: str | None) -> None:
     clean_base = settings.PUBLIC_BASE_URL.rstrip("/")
     if clean_origin == clean_base:
         return
-    # In dev, allow localhost variations
+    # In dev, allow localhost variations via exact prefix (not substring) matching.
+    # BUG-7 fix: the old "in" check matched e.g. "https://not-localhost.evil.com".
     if settings.ENV != "production" and (
-        "localhost" in clean_origin or "127.0.0.1" in clean_origin
+        clean_origin == "http://localhost"
+        or clean_origin.startswith("http://localhost:")
+        or clean_origin == "http://127.0.0.1"
+        or clean_origin.startswith("http://127.0.0.1:")
     ):
         return
     raise HTTPException(

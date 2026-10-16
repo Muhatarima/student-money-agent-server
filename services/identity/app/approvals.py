@@ -20,6 +20,10 @@ from .crypto import ensure_utc, hash_token, new_token
 from .db import get_db
 from .models import Approval, Signature, User
 from .passkeys import finish_auth, start_auth
+from .redis_client import redis_client
+
+# Maximum WebAuthn verification attempts per approval before auto-rejection
+_MAX_VERIFY_ATTEMPTS = 3
 
 router = APIRouter(tags=["approvals"])
 templates = Jinja2Templates(directory="templates")
@@ -215,11 +219,45 @@ async def verify_and_confirm_approval(
     if ensure_utc(approval.expires_at) < now:
         raise HTTPException(status_code=status.HTTP_410_GONE, detail="Approval has expired.")
 
-    # 2. Derive expected challenge and finish WebAuthn auth
-    challenge = derive_approval_challenge(approval.payload_hash, approval.nonce)
-    await finish_auth(approval.user_id, payload.credential, challenge, db, origin)
+    # 2. Per-approval attempt rate limit (max 3 failed WebAuthn attempts — then reject)
+    attempt_key = f"approval:attempts:{approval_id}"
+    try:
+        attempts = int(await redis_client.get(attempt_key) or 0)
+        if attempts >= _MAX_VERIFY_ATTEMPTS:
+            approval.state = "rejected"
+            await audit(
+                db,
+                actor="system",
+                action="approval.rejected_max_attempts",
+                target=approval.id,
+                details={"attempts": attempts},
+            )
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed attempts. This approval has been rejected.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Redis failure: allow request to proceed (fail-open for availability)
 
-    # 3. Store raw signature assertion and mark approved
+    # 3. Derive expected challenge and finish WebAuthn auth
+    challenge = derive_approval_challenge(approval.payload_hash, approval.nonce)
+    try:
+        await finish_auth(approval.user_id, payload.credential, challenge, db, origin)
+    except HTTPException:
+        # Increment attempt counter on WebAuthn failure
+        try:
+            async with redis_client.pipeline(transaction=True) as pipe:
+                await pipe.incr(attempt_key)
+                await pipe.expire(attempt_key, 900)  # TTL matches max approval window (15min)
+                await pipe.execute()
+        except Exception:
+            pass
+        raise
+
+    # 4. Store raw signature assertion and mark approved — DO NOT COMMIT YET
     cred_id_bytes = base64url_to_bytes(payload.credential["id"])
     auth_data = base64url_to_bytes(payload.credential["response"]["authenticatorData"])
     client_data = base64url_to_bytes(payload.credential["response"]["clientDataJSON"])
@@ -239,7 +277,6 @@ async def verify_and_confirm_approval(
     )
     db.add(signature_record)
     approval.state = "approved"
-
     await audit(
         db,
         actor=str(approval.user_id),
@@ -247,16 +284,17 @@ async def verify_and_confirm_approval(
         target=approval.id,
         details={"signature_id": str(sig_id)},
     )
-    await db.commit()
+    # NOTE: db.commit() is intentionally AFTER the Money callback succeeds.
+    # If the callback fails, we roll back so the approval stays "pending" and
+    # the student can retry without burning their passkey biometric.
 
-    # 4. Notify Engineer B (Money service) via internal callback
+    # 5. Notify Engineer B (Money service) via internal callback
     confirmed_payload = ApprovalConfirmed(
         approval_id=approval.id,
         subject_id=approval.subject_id,
         payload_hash=approval.payload_hash,
         signature_id=sig_id,
     )
-
     headers = {"X-Internal-Key": settings.INTERNAL_API_KEY}
     url = f"{settings.MONEY_URL.rstrip('/')}/internal/approvals/confirmed"
 
@@ -266,31 +304,28 @@ async def verify_and_confirm_approval(
                 url, json=confirmed_payload.model_dump(mode="json"), headers=headers
             )
             if resp.status_code >= 400:
-                await audit(
-                    db,
-                    actor="system",
-                    action="approval.money_callback_failed",
-                    target=approval.id,
-                    details={"status_code": resp.status_code, "response": resp.text},
-                )
-                await db.commit()
+                # Money rejected — rollback so student can retry
+                await db.rollback()
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="Something went wrong, no money was moved.",
+                    detail="Payment service error. No money was moved. Please try again.",
                 )
         except httpx.RequestError as exc:
-            await audit(
-                db,
-                actor="system",
-                action="approval.money_callback_error",
-                target=approval.id,
-                details={"error": str(exc)},
-            )
-            await db.commit()
+            # Network error — rollback so student can retry
+            await db.rollback()
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Something went wrong, no money was moved.",
+                detail="Payment service unreachable. No money was moved. Please try again.",
             ) from exc
+
+    # 6. Only commit once Money has confirmed receipt
+    await db.commit()
+
+    # Clean up attempt counter on success
+    try:
+        await redis_client.delete(attempt_key)
+    except Exception:
+        pass
 
     return {"status": "ok", "approval_id": str(approval.id)}
 

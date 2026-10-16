@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request, Response, status
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
 from .db import engine, get_db
+from .jobs import run_worker
 from .redis_client import redis_client
 
 # ── Startup guard ─────────────────────────────────────────────────────────────
@@ -22,7 +24,17 @@ async def lifespan(app: FastAPI):
             "ENV=production but PUBLIC_BASE_URL is not https. "
             "Set PUBLIC_BASE_URL to your Railway HTTPS domain."
         )
+    # ISSUE-8 fix: start the background purge worker as an asyncio task so that
+    # expired documents, approvals, and link tokens are cleaned up automatically
+    # even in a single-process Railway deploy (no separate worker dyno needed).
+    purge_task = asyncio.create_task(run_worker())
     yield
+    # Cancel the worker on shutdown and wait for it to exit cleanly.
+    purge_task.cancel()
+    try:
+        await purge_task
+    except asyncio.CancelledError:
+        pass
     # Dispose DB connection pool on shutdown.
     await engine.dispose()
 

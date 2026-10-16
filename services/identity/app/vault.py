@@ -166,6 +166,11 @@ async def get_upload_page(
     if user is None:
         raise HTTPException(status_code=404, detail="User not found.")
 
+    # BUG-4 fix: mark token as used so the upload link cannot be replayed
+    # within its 15-minute window by anyone who intercepts the URL.
+    link_token.used_at = now
+    await db.commit()
+
     session_val = sign_vault_session(user.id)
     csrf = generate_csrf_token(session_val)
 

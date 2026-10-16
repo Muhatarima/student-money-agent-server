@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<p>Check every line. Your fingerprint approves exactly this, nothing else.</p>
+<table>
+  {% for label, value in rows %}
+  <tr><th>{{ label }}</th><td>{{ value }}</td></tr>
+  {% endfor %}
+</table>
+{% if approval.kind == "rule" %}
+<p class="note">This rule will run automatically within these limits until you freeze it.</p>
+{% endif %}
+<p>Time left: <span class="countdown" data-expires-at="{{ expires_at }}"></span></p>
+<button class="primary" data-action="approve" data-id="{{ approval.id }}" data-token="{{ token }}">Approve with fingerprint</button>
+<button data-action="cancel" data-id="{{ approval.id }}" data-token="{{ token }}">Cancel</button>
+{% endblock %}

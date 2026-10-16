@@ -94,3 +94,32 @@ they answer 401 without it. The app refuses to start if these are missing.
 `uvicorn tests.mocks.mock_identity:app --port 8003`, then
 `.venv\Scripts\python -c "import asyncio; from app.clients import MoneyClient; print(asyncio.run(MoneyClient().get_rate('BDT_IDR')))"`
 → prints a rate of 135.20. (Stop the mocks before running Engineer B's real money service on 8002.)
+
+## 6. Anthropic API key (for the AI agent)
+
+**What to do**
+1. Go to console.anthropic.com → sign in → **API Keys** → **Create Key**. Copy it.
+2. In `services\messaging\.env` add `ANTHROPIC_API_KEY=<your key>` (and optionally
+   `LLM_MODEL=claude-opus-5-5`, which is already the default).
+3. Never paste the key into chat, code, or git. Set a monthly spend limit in the console.
+
+**Why** `app/agent.py` uses Claude to understand messages like "convert 10000 taka".
+Without a key the AI is off: every text gets the 3-button menu (Rates / My rules /
+Freeze), and `FREEZE` still works. That's the fake path the tests use.
+
+**Affects** `.env` (`ANTHROPIC_API_KEY`, `LLM_MODEL`), `app/config.py`, `app/agent.py`.
+
+**How to check** Run the api, the worker and the mocks (`uvicorn tests.mocks.mock_money:app --port 8002`,
+`uvicorn tests.mocks.mock_identity:app --port 8003`), then send "what's the taka to rupiah rate?"
+on WhatsApp → the answer mentions 135.20. With the key removed you get the button menu instead.
+
+## 7. Run all three messaging processes
+
+**What to do** In three terminals (venv active, from `services\messaging`):
+`uvicorn app.main:app --port 8001`, `python -m app.worker`, `python -m app.notifier`.
+
+**Why** The api only queues messages; the worker answers them; the notifier sends receipts
+and approval links from Money/Identity events.
+
+**How to check** `python -m scripts.push_fake_event transfer_settled` → the notifier
+terminal shows `[fake send] text to ****1234` (or the message arrives with `WA_FAKE_SEND=false`).

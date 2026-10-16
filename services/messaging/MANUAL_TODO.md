@@ -94,20 +94,3 @@ they answer 401 without it. The app refuses to start if these are missing.
 `uvicorn tests.mocks.mock_identity:app --port 8003`, then
 `.venv\Scripts\python -c "import asyncio; from app.clients import MoneyClient; print(asyncio.run(MoneyClient().get_rate('BDT_IDR')))"`
 → prints a rate of 135.20. (Stop the mocks before running Engineer B's real money service on 8002.)
-
-## 6. Push the branch (GitHub said 403: no write access)
-
-**What to do**
-1. Ask the repo owner (`Muhatarima`) to add your GitHub account `anoobrah` as a
-   collaborator: repo → Settings → Collaborators → Add people. Accept the email invite.
-2. Then, from the repo root: `git push -u origin a-day1-autonomous`
-3. Don't open a pull request yet; review `PROGRESS.md` first.
-
-**Why** `git push` returned "Permission to Muhatarima/student-money-agent-server.git
-denied to anoobrah" (HTTP 403). Everything is committed locally; nothing is lost.
-
-**Affects** GitHub permissions only (no code change). Note: this push also uploads the
-money-service `B-*` commits, because local `main` was never pushed.
-
-**How to check** `git push` prints `branch 'a-day1-autonomous' set up to track 'origin/a-day1-autonomous'`,
-and the branch shows on GitHub.

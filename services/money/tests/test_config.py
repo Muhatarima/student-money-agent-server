@@ -14,3 +14,11 @@ def test_missing_setting_error_hides_secret_values(monkeypatch):
     text = str(error.value)  # what a crash traceback prints
     assert "database_url" in text  # still names the missing field
     assert "s3cr3t" not in text
+
+
+def test_env_must_be_set(monkeypatch):
+    # No silent "dev" default: a forgotten ENV in production would turn on /dev/seed (mints money)
+    monkeypatch.delenv("ENV")
+    with pytest.raises(ValidationError) as error:
+        Settings(_env_file=None)
+    assert "env" in str(error.value)

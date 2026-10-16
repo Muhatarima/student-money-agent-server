@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
-    env: str = "dev"
+    env: str  # "dev", "test" or "production". Required: no default that turns on dev routes
     database_url: str
     redis_url: str
     internal_api_key: str

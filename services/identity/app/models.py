@@ -16,7 +16,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 Hash = String(64)  # sha256 hex
 
@@ -61,6 +61,7 @@ class Passkey(IdMixin, Base):
     __tablename__ = "passkeys"
 
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    user: Mapped[User] = relationship()
     credential_id: Mapped[bytes] = mapped_column(LargeBinary, unique=True)
     public_key: Mapped[bytes] = mapped_column(LargeBinary)
     sign_count: Mapped[int] = mapped_column(default=0)

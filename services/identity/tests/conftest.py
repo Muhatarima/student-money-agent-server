@@ -92,3 +92,20 @@ async def client(session) -> AsyncIterator[httpx.AsyncClient]:
     async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8003") as c:
         yield c
     app.dependency_overrides.clear()
+
+
+# --- WebAuthn is mocked in every test (see fake_webauthn.py) ---
+
+from app import passkeys  # noqa: E402
+from tests import fake_webauthn  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def webauthn(monkeypatch):
+    monkeypatch.setattr(
+        passkeys, "verify_registration_response", fake_webauthn.verify_registration_response
+    )
+    monkeypatch.setattr(
+        passkeys, "verify_authentication_response", fake_webauthn.verify_authentication_response
+    )
+    return fake_webauthn

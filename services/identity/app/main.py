@@ -3,13 +3,14 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from app import users
+from app import passkeys, users
 
 HERE = Path(__file__).parent.parent
 
 app = FastAPI(title="Identity")
 app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 app.include_router(users.router)
+app.include_router(passkeys.router)
 
 
 @app.get("/health")

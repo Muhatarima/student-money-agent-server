@@ -35,8 +35,13 @@ async def balance(user_id: uuid.UUID) -> BalanceOut:
     return BalanceOut(user_id=user_id, balances={"BDT": Decimal("5000.00"), "IDR": Decimal("0")})
 
 
+MAX_PER_TX = Decimal("50000")  # like the real money service's default limit
+
+
 @app.post("/internal/proposals/transfer")
 async def propose_transfer(proposal: TransferProposal) -> ProposalResult:
+    if proposal.amount > MAX_PER_TX:
+        return ProposalResult(status="rejected", reason="over_transaction_limit")
     return pending()
 
 

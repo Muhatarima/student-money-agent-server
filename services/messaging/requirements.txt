@@ -4,6 +4,7 @@ pydantic-settings
 python-dotenv
 redis
 httpx
+anthropic
 pytest
 pytest-asyncio
 fakeredis

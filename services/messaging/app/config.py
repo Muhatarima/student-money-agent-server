@@ -22,5 +22,9 @@ class Settings(BaseSettings):
     wa_phone_number_id: str = ""
     wa_api_version: str = "v21.0"
 
+    # AI agent. No key = the agent is off and users get the button menu instead.
+    anthropic_api_key: SecretStr = SecretStr("")
+    llm_model: str = "claude-opus-5-5"
+
 
 settings = Settings()

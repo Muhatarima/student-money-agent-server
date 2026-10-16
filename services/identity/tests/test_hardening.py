@@ -149,3 +149,15 @@ def test_production_with_https_and_s3_starts(monkeypatch):
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://identity.example")
     monkeypatch.setenv("STORAGE_BACKEND", "s3")
     assert Settings(_env_file=None).is_production
+
+
+def test_real_uvicorn_access_log_line_is_masked_and_does_not_crash():
+    from uvicorn.logging import AccessFormatter
+
+    args = ("127.0.0.1:5000", "GET", "/approve/abc?t=SECRETTOKEN123", "1.1", 200)
+    record = logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d', args, None
+    )
+    assert MASK.filter(record)
+    line = AccessFormatter(use_colors=False).format(record)
+    assert "SECRETTOKEN123" not in line and "/approve/abc?t=****" in line

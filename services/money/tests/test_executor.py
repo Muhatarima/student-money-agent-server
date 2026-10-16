@@ -288,6 +288,10 @@ async def assert_blocked(session, redis, t, reason):
     done = await session.get(Transfer, t.id, populate_existing=True)
     assert done.failure_reason == reason
     assert await ledger_rows(session, t.id) == []
+    # The user approved it, so they must hear that it didn't happen (and why)
+    [event] = await events(redis)
+    assert event["type"] == "transfer_failed"
+    assert event["data"] == {"transfer_id": str(t.id), "reason": reason}
 
 
 @pytest.mark.parametrize("state", [S.CREATED, S.QUOTED, S.PENDING_APPROVAL])

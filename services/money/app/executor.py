@@ -58,6 +58,8 @@ async def execute_transfer(
         await advance(session, transfer.id, S.EXPIRED, failure_reason=reason)
         await session.commit()
         log.warning("transfer %s not submitted: %s", transfer.id, reason)
+        # The user already approved it, so tell them it didn't happen
+        await _notify(redis, "transfer_failed", transfer, {"reason": reason})
         return S.EXPIRED
 
     quote = await session.get(Quote, transfer.quote_id)

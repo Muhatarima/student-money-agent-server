@@ -27,7 +27,10 @@ async def enqueue_message(msg: dict) -> None:
     job = {
         "msg_id": msg["id"],
         "from": msg.get("from", ""),
+        "type": msg.get("type", ""),
         "text": msg.get("text", {}).get("body", ""),
+        # Tapped reply button (our menu): its id, e.g. "rates"
+        "button_id": msg.get("interactive", {}).get("button_reply", {}).get("id", ""),
     }
     try:
         await enqueue_incoming(job)

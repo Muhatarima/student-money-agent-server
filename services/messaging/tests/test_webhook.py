@@ -96,7 +96,26 @@ async def test_same_message_three_times_is_queued_once(client, redis):
 async def test_queued_job_has_the_message(client, redis):
     await post_signed(client, message_payload(msg_id="wamid.JOB", text="hello"))
     job = json.loads(await redis.rpop("queue:incoming"))
-    assert job == {"msg_id": "wamid.JOB", "from": "8801700001234", "text": "hello"}
+    assert job == {
+        "msg_id": "wamid.JOB",
+        "from": "8801700001234",
+        "type": "text",
+        "text": "hello",
+        "button_id": "",
+    }
+
+
+async def test_button_reply_job_has_the_button_id(client, redis):
+    msg = {
+        "id": "wamid.BTN",
+        "from": "8801700001234",
+        "type": "interactive",
+        "interactive": {"type": "button_reply", "button_reply": {"id": "rates", "title": "Rates"}},
+    }
+    body = json.dumps({"entry": [{"changes": [{"value": {"messages": [msg]}}]}]}).encode()
+    await post_signed(client, body)
+    job = json.loads(await redis.rpop("queue:incoming"))
+    assert (job["type"], job["button_id"], job["text"]) == ("interactive", "rates", "")
 
 
 async def test_enqueue_failure_forgets_dedupe_key(client, redis, monkeypatch):

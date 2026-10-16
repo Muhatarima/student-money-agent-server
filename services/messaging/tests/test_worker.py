@@ -100,10 +100,10 @@ async def test_unreadable_job_goes_to_dead_queue(redis, handled):
 
 
 async def test_handler_never_logs_message_text(capsys, monkeypatch):
-    async def no_sleep(seconds):
+    async def fake_handle_message(job):
         pass
 
-    monkeypatch.setattr(worker.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(worker.handlers, "handle_message", fake_handle_message)
     await worker.handle({"msg_id": "wamid.X", "from": "8801700001234", "text": "secret text"})
     out = capsys.readouterr().out
     assert "secret text" not in out

@@ -151,11 +151,19 @@ deploying (Part B).
 `DEPLOY.md` has the exact clicks. These are the steps only you can do, in order.
 
 ### ☐ B1. Review and merge the work into `main`
-**Do:** on GitHub, open a pull request from `build/integration` into `main`, read it, and
-merge it. (The finished work is on `build/integration`; nothing was ever committed to `main`.)
-Also recommended: **Settings** → **Branches** → protect `main` (require a review).
-**Why:** Railway deploys one branch; it should be reviewed code.
-**Check:** `main` on GitHub has `DEPLOY.md` and `tests/e2e`.
+**Do:**
+1. On GitHub, open the **Actions** tab: the latest **CI** run for `build/integration` should
+   be green (4 jobs: contracts, messaging, money, identity). Red? Click the red job to see
+   which test failed.
+2. Open a pull request from `build/integration` into `main`, read it, wait for CI to be
+   green on the pull request, then merge it. (Nothing was ever committed to `main`.)
+3. **Settings** → **Branches** (or **Rules** → **Rulesets**) → add a rule for `main`:
+   require a pull request with 1 review, and require the status checks `contracts` and
+   `service (messaging)`, `service (money)`, `service (identity)` to pass.
+
+**Why:** Railway deploys one branch; it should be reviewed code that passed every test.
+**Check:** `main` on GitHub has `DEPLOY.md` and `tests/e2e`, and pushing directly to `main`
+is refused.
 
 ### ☐ B2. New production secrets
 **Do:** `DEPLOY.md` step 1: six NEW values (never the dev ones), saved in the password manager.

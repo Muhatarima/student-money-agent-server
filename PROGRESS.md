@@ -22,9 +22,10 @@ deployed and nothing was committed to `main`. What's left is human-only: `MANUAL
   with their own key and purged after 7 days.
 - **Read these next:** `MANUAL_TODO.md` (your ordered checklist), `DEPLOY.md` (Railway +
   R2 recipe), each `services/*/README.md`, and "Decisions to review" in each phase below.
-- **Known limits (not bugs in the demo path):** money moves only through the fake
-  `MockProvider` (its records are per process, see Phase 5); no CI workflow yet (the
-  handbook's Day 0 asks for `.github/workflows/ci.yml`; it wasn't in the finish phases).
+- **CI:** `.github/workflows/ci.yml` runs ruff + pytest for the 3 services and the
+  contracts on every push and pull request (see "CI" below).
+- **Known limit (not a bug in the demo path):** money moves only through the fake
+  `MockProvider` (its records are per process, see Phase 5).
 
 ## Phase 1: quick fixes (branch `a-day1-autonomous`)
 
@@ -166,6 +167,26 @@ Decisions to review:
   production is predictable. Raise them to rehearse failures.
 - Production limits suggested: `MAX_PER_TX_BDT=5000`, `MAX_PER_DAY_BDT=10000`.
 
+## CI (branch `build/integration`, pushed)
+
+| Commit | What |
+|---|---|
+| `3264bb6` CI | `.github/workflows/ci.yml` on every push and pull request. Job `contracts`: ruff + `pytest tests/contracts`. Job `service` (messaging, money, identity in parallel, with Postgres 16 + Redis 7 and the two `_test` databases): `pip install -r requirements.txt`, `ruff check .`, `pytest -q`; money also fails if `policy.py` drops below 100% coverage |
+
+- New `tests/contracts/test_contracts.py` (9 tests: hash ignores key order, a known-answer
+  hash that pins the algorithm, one digit changes the hash, Decimal amounts, bad proposals
+  rejected, event round trip). It lives outside `packages/contracts`, so the package is
+  unchanged.
+- Checked before pushing: every job's commands in `python:3.12-slim` on Linux, on a clean
+  `git archive` of the commit (no `.env`, no venvs), with fresh Postgres + Redis: all green.
+  (I also checked that no suite secretly relies on a local `.env`.)
+- `tests/e2e` is not in CI (several minutes, builds 3 images): run it locally before merging.
+
+Optional contract cleanup (style only, needs "contract change approved"): `contracts/hashing.py`
+has `import hashlib, json` on one line and `contracts/events.py` has a comment longer than 88
+characters. CI checks the contracts only for real errors (syntax, undefined/unused names) so
+these don't fail it.
+
 ## Test results (on `build/integration`, final)
 - messaging: `pytest -q` → 171 passed; `ruff check .` clean
 - money: `pytest -q` → 285 passed; `ruff check .` clean; `policy.py` 100% coverage.
@@ -178,5 +199,6 @@ Decisions to review:
 None.
 
 ## Next step
-Human-only: work through `MANUAL_TODO.md` from A1. Code work, if wanted later: a GitHub
-Actions CI workflow (handbook Day 0) and a real licensed provider (handbook section 11).
+Human-only: work through `MANUAL_TODO.md` from A1 (B1 now includes checking the green CI
+run and making it required for `main`). Code work, if wanted later: a real licensed provider
+(handbook section 11).

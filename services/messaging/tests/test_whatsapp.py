@@ -25,6 +25,9 @@ def meta(monkeypatch):
         code = state["replies"].pop(0)
         if code == "timeout":
             raise httpx.ConnectTimeout("slow")
+        if 400 <= code < 500:  # Meta's error body shape
+            error = {"code": 131030, "message": "Recipient not in allowed list"}
+            return httpx.Response(code, json={"error": error})
         return httpx.Response(code, json={})
 
     async def no_sleep(seconds):
@@ -111,9 +114,18 @@ async def test_gives_up_after_3_tries(meta):
 
 async def test_4xx_is_never_retried(meta):
     meta["replies"] = [400]
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(RuntimeError):
         await whatsapp.send_text(TO, "hi")
     assert len(meta["calls"]) == 1
+
+
+async def test_4xx_error_shows_meta_code_and_message(meta):
+    meta["replies"] = [400]
+    with pytest.raises(RuntimeError) as error:
+        await whatsapp.send_text(TO, "hi")
+    text = str(error.value)
+    assert "400" in text and "131030" in text and "Recipient not in allowed list" in text
+    assert TO not in text  # no full phone in errors
 
 
 async def test_missing_token_refuses_to_send(meta, monkeypatch):
@@ -125,6 +137,6 @@ async def test_missing_token_refuses_to_send(meta, monkeypatch):
 
 async def test_token_never_appears_in_errors(meta):
     meta["replies"] = [401]
-    with pytest.raises(httpx.HTTPStatusError) as error:
+    with pytest.raises(RuntimeError) as error:
         await whatsapp.send_text(TO, "hi")
     assert "secret-token-123" not in str(error.value)

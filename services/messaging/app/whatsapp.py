@@ -40,6 +40,10 @@ async def _send(to: str, message: dict) -> None:
     payload = {"messaging_product": "whatsapp", "to": to} | message
     if settings.wa_fake_send:
         fake_outbox.append(payload)
+        if settings.wa_fake_send_url:  # lets demos and the e2e test see other processes' sends
+            async with httpx.AsyncClient(timeout=10, transport=transport) as client:
+                response = await client.post(settings.wa_fake_send_url, json=payload)
+                response.raise_for_status()
         log.info("[fake send] %s to %s", message["type"], mask_phone(to))
         return
 

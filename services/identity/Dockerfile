@@ -18,4 +18,5 @@ USER app
 # Secrets come from the platform's environment variables, never from a file in the image.
 # --proxy-headers + --forwarded-allow-ips: behind Railway's proxy, use the real client IP
 # (rate limits) and https scheme. Only the proxy can reach the container.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8003} --proxy-headers --forwarded-allow-ips='*'"]
+# Default 0.0.0.0 (IPv4). On Railway set HOST=:: (IPv6): its private network needs it
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8003} --proxy-headers --forwarded-allow-ips='*'"]

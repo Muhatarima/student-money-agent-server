@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authorize Approval - Student Money Agent</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #1e293b;
+            --text: #f8fafc;
+            --muted: #94a3b8;
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --border: #334155;
+            --badge-bg: #1e3a8a;
+            --badge-text: #93c5fd;
+            --warning-bg: #451a03;
+            --warning-text: #fdba74;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 28px 24px;
+            width: 100%;
+            max-width: 440px;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .icon { font-size: 40px; margin-bottom: 8px; }
+        h1 { font-size: 20px; font-weight: 700; }
+        .timer-badge {
+            display: inline-block;
+            background: var(--warning-bg);
+            color: var(--warning-text);
+            padding: 4px 10px;
+            border-radius: 9999px;
+            font-size: 13px;
+            font-weight: 600;
+            margin-top: 8px;
+        }
+        .summary-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 14px;
+        }
+        .summary-table tr {
+            border-bottom: 1px solid var(--border);
+        }
+        .summary-table td {
+            padding: 10px 4px;
+        }
+        .summary-table td.label {
+            color: var(--muted);
+            width: 45%;
+        }
+        .summary-table td.value {
+            font-weight: 600;
+            text-align: right;
+        }
+        .notice {
+            background: #172554;
+            border-left: 3px solid #3b82f6;
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            line-height: 1.4;
+            color: #bfdbfe;
+            margin-bottom: 20px;
+        }
+        .btn-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            width: 100%;
+            padding: 12px 18px;
+            border: none;
+            border-radius: 10px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn-primary { background: var(--primary); color: #fff; }
+        .btn-primary:hover { background: var(--primary-hover); }
+        .btn-danger { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+        .btn-danger:hover { color: var(--danger); border-color: var(--danger); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .status {
+            margin-top: 14px;
+            font-size: 14px;
+            text-align: center;
+            display: none;
+        }
+        .status.error { color: var(--danger); display: block; }
+        .status.info { color: var(--muted); display: block; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <div class="icon">🛡️</div>
+            <h1>Confirm {{ kind | title }}</h1>
+            <div class="timer-badge" id="countdown-badge">Expires in: <span id="countdown">--:--</span></div>
+        </div>
+
+        {% if kind == "rule" %}
+        <div class="notice">
+            This rule will run automatically within these limits until you freeze it.
+        </div>
+        {% endif %}
+
+        <table class="summary-table">
+            {% for key, val in summary.items() %}
+            <tr>
+                <td class="label">{{ key | replace('_', ' ') | title }}</td>
+                <td class="value">{{ val }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+
+        <div class="btn-group">
+            <button id="btn-approve" class="btn btn-primary" onclick="approveWithPasskey()">
+                <span>Approve with fingerprint / Face ID</span>
+            </button>
+            <button id="btn-cancel" class="btn btn-danger" onclick="cancelApproval()">
+                <span>Cancel Request</span>
+            </button>
+        </div>
+
+        <div id="status-msg" class="status"></div>
+    </div>
+
+    <script src="https://unpkg.com/@simplewebauthn/browser@10.0.0/dist/bundle/index.umd.min.js"></script>
+    <script>
+        const approvalId = "{{ approval_id }}";
+        const token = "{{ token }}";
+        const expiresAt = new Date("{{ expires_at_iso }}").getTime();
+
+        // Countdown timer
+        function updateTimer() {
+            const now = new Date().getTime();
+            const diff = expiresAt - now;
+            if (diff <= 0) {
+                document.getElementById("countdown").textContent = "Expired";
+                document.getElementById("btn-approve").disabled = true;
+                document.getElementById("btn-cancel").disabled = true;
+                return;
+            }
+            const mins = Math.floor(diff / 60000);
+            const secs = Math.floor((diff % 60000) / 1000);
+            document.getElementById("countdown").textContent =
+                `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+        }
+        setInterval(updateTimer, 1000);
+        updateTimer();
+
+        async function approveWithPasskey() {
+            const btnApprove = document.getElementById("btn-approve");
+            const btnCancel = document.getElementById("btn-cancel");
+            const status = document.getElementById("status-msg");
+            btnApprove.disabled = true;
+            btnCancel.disabled = true;
+            status.className = "status info";
+            status.textContent = "Deriving cryptographic challenge...";
+
+            try {
+                // 1. Get options bound to sha256(payload_hash + nonce)
+                const optResp = await fetch(`/approve/${approvalId}/options`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ t: token }),
+                });
+                if (!optResp.ok) {
+                    const err = await optResp.json().catch(() => ({}));
+                    throw new Error(err.detail || "Failed to start biometric authentication.");
+                }
+                const optionsJSON = await optResp.json();
+
+                // 2. Authenticate using passkey
+                status.textContent = "Waiting for fingerprint / Face ID...";
+                const asseResp = await SimpleWebAuthnBrowser.startAuthentication({ optionsJSON });
+
+                // 3. Verify assertion and confirm with ledger
+                status.textContent = "Verifying signature and confirming transfer...";
+                const verResp = await fetch(`/approve/${approvalId}/verify`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ t: token, credential: asseResp }),
+                });
+
+                if (!verResp.ok) {
+                    const err = await verResp.json().catch(() => ({}));
+                    throw new Error(err.detail || "Something went wrong, no money was moved.");
+                }
+
+                // Success
+                window.location.href = `/approve/${approvalId}/approved`;
+            } catch (err) {
+                console.error(err);
+                btnApprove.disabled = false;
+                btnCancel.disabled = false;
+                status.className = "status error";
+                status.textContent = err.message || "Approval failed.";
+            }
+        }
+
+        async function cancelApproval() {
+            if (!confirm("Are you sure you want to cancel this request?")) return;
+            try {
+                await fetch(`/approve/${approvalId}/cancel`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ t: token }),
+                });
+                alert("Request has been cancelled.");
+                window.location.reload();
+            } catch (e) {
+                console.error(e);
+            }
+        }
+    </script>
+</body>
+</html>

@@ -118,3 +118,12 @@ async def test_money_comes_back_as_decimal_not_float(conn):
     amount = await conn.scalar(select(Transfer.amount).where(Transfer.idempotency_key == "k-dec"))
     assert isinstance(amount, Decimal)
     assert amount == Decimal("0.1000")
+
+
+async def test_reconcile_queries_have_partial_indexes(conn):
+    # Reconcile looks for the few SUBMITTED / APPROVED rows every 5 minutes: no full scans
+    rows = await conn.execute(
+        text("SELECT indexname FROM pg_indexes WHERE tablename = 'transfers'")
+    )
+    names = set(rows.scalars())
+    assert {"ix_transfers_submitted_updated_at", "ix_transfers_approved_updated_at"} <= names

@@ -159,6 +159,12 @@ class Transfer(IdMixin, Base):
             "updated_at",
             postgresql_where=text("state = 'SUBMITTED'"),
         ),
+        # ...and for APPROVED rows that were never executed (e.g. after a restart)
+        Index(
+            "ix_transfers_approved_updated_at",
+            "updated_at",
+            postgresql_where=text("state = 'APPROVED'"),
+        ),
     )
 
     user_id: Mapped[uuid.UUID]

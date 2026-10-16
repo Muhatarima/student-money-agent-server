@@ -17,4 +17,4 @@ known-third-party = ["alembic"]
 
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's normal style: def route(session = Depends(get_session))
-extend-immutable-calls = ["fastapi.Depends"]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Form", "fastapi.File"]

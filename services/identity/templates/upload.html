@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+{% if not logged_in %}
+<p>First, confirm it's you.</p>
+<button class="primary" data-action="uploadLogin" data-id="{{ link_id }}" data-token="{{ token }}">Confirm with fingerprint</button>
+{% else %}
+<form method="post" action="/upload/{{ link_id }}" enctype="multipart/form-data">
+  <input type="hidden" name="t" value="{{ token }}">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <p><label>Document type
+    <select name="doc_type">
+      {% for doc_type in doc_types %}<option value="{{ doc_type }}">{{ doc_type.replace("_", " ") }}</option>{% endfor %}
+    </select>
+  </label></p>
+  <p><input type="file" name="file" accept="application/pdf,image/jpeg,image/png" required></p>
+  <p class="note">PDF, JPEG or PNG, up to 10 MB. Encrypted, and deleted automatically after 7 days.</p>
+  <button class="primary" type="submit">Upload securely</button>
+</form>
+{% endif %}
+{% endblock %}

@@ -3,7 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from app import approvals, passkeys, signatures, users
+from app import approvals, passkeys, signatures, users, vault
 
 HERE = Path(__file__).parent.parent
 
@@ -13,6 +13,7 @@ app.include_router(users.router)
 app.include_router(passkeys.router)
 app.include_router(approvals.router)
 app.include_router(signatures.router)
+app.include_router(vault.router)
 
 
 @app.get("/health")

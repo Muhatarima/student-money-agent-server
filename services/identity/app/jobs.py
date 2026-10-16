@@ -18,8 +18,9 @@ log = logging.getLogger(__name__)
 EVERY_SECONDS = 600
 
 
-async def purge(session: AsyncSession) -> None:
-    now = datetime.now(UTC)
+async def purge(session: AsyncSession, now: datetime | None = None) -> None:
+    # now can be set to a later time, e.g. the e2e demo purges "as if 8 days later"
+    now = now or datetime.now(UTC)
 
     # 1. Documents past delete_after: delete the file AND destroy its key
     expired_docs = await session.execute(
@@ -46,11 +47,15 @@ async def purge(session: AsyncSession) -> None:
     await session.commit()
 
 
+async def purge_once(now: datetime | None = None) -> None:
+    async with SessionLocal() as session:
+        await purge(session, now)
+
+
 async def main() -> None:
     while True:
         try:
-            async with SessionLocal() as session:
-                await purge(session)
+            await purge_once()
         except Exception:
             log.exception("purge failed, will try again")  # one failure never stops the loop
         await asyncio.sleep(EVERY_SECONDS)

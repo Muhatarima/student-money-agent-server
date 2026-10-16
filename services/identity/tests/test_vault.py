@@ -225,6 +225,16 @@ async def test_purge_keeps_documents_not_due_yet(client, session, store):
     assert doc.wrapped_key is not None and len(list(store.root.iterdir())) == 1
 
 
+async def test_purge_as_if_8_days_later_removes_a_new_document(client, session, store):
+    # The e2e demo uses this to "jump" past the 7-day auto-delete
+    user, link_id, token, csrf = await logged_in(client, session)
+    await send_file(client, link_id, token, csrf)
+    await jobs.purge(session, now=datetime.now(UTC) + timedelta(days=8))
+    session.expunge_all()
+    doc = await session.scalar(select(Document).where(Document.user_id == user.id))
+    assert doc.wrapped_key is None and list(store.root.iterdir()) == []
+
+
 async def test_purge_cleans_expired_links_and_approvals(session):
     user = await make_user(session)
     past = datetime.now(UTC) - timedelta(seconds=1)

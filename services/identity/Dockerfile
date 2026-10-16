@@ -11,8 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # app/, alembic/, templates/, static/ (see Dockerfile.dockerignore for what stays out)
 COPY services/identity .
 
-# Never run as root
-RUN useradd --create-home app && chown -R app /srv
+# Never run as root. vault_local/ exists so a dev docker volume mounted there is ours too.
+RUN mkdir -p vault_local && useradd --create-home app && chown -R app /srv
 USER app
 
 # Secrets come from the platform's environment variables, never from a file in the image.

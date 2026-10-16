@@ -1,0 +1,23 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+sqlalchemy[asyncio]
+asyncpg
+alembic
+redis
+httpx
+jinja2
+python-multipart
+webauthn
+cryptography
+boto3
+filetype
+pytest
+pytest-asyncio
+httpx
+aiosqlite
+fakeredis
+ruff
+-e ../../packages/contracts

@@ -96,7 +96,7 @@ async def client(session) -> AsyncIterator[httpx.AsyncClient]:
 
 # --- WebAuthn is mocked in every test (see fake_webauthn.py) ---
 
-from app import passkeys  # noqa: E402
+from app import passkeys, signatures  # noqa: E402
 from tests import fake_webauthn  # noqa: E402
 
 
@@ -107,5 +107,8 @@ def webauthn(monkeypatch):
     )
     monkeypatch.setattr(
         passkeys, "verify_authentication_response", fake_webauthn.verify_authentication_response
+    )
+    monkeypatch.setattr(
+        signatures, "verify_authentication_response", fake_webauthn.verify_authentication_response
     )
     return fake_webauthn

@@ -51,8 +51,13 @@ RULE_ROWS = [
 ]
 
 
+def derive_challenge(payload_hash_: str, nonce: str) -> bytes:
+    """The passkey challenge: binds the fingerprint signature to exactly this payload."""
+    return hashlib.sha256((payload_hash_ + nonce).encode()).digest()
+
+
 def challenge_for(approval: Approval) -> bytes:
-    return hashlib.sha256((approval.payload_hash + approval.nonce).encode()).digest()
+    return derive_challenge(approval.payload_hash, approval.nonce)
 
 
 def summary_is_intact(approval: Approval) -> bool:

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Document Upload - Student Money Agent</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #1e293b;
+            --text: #f8fafc;
+            --muted: #94a3b8;
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --border: #334155;
+            --danger: #ef4444;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 32px 24px;
+            width: 100%;
+            max-width: 440px;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4);
+        }
+        .header { text-align: center; margin-bottom: 24px; }
+        .icon { font-size: 44px; margin-bottom: 8px; }
+        h1 { font-size: 22px; font-weight: 700; }
+        p.subtitle { font-size: 14px; color: var(--muted); margin-top: 4px; }
+        .notice {
+            background: #172554;
+            border-left: 3px solid #3b82f6;
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            line-height: 1.4;
+            color: #bfdbfe;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 18px;
+            text-align: left;
+        }
+        label {
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--muted);
+            margin-bottom: 6px;
+        }
+        select, input[type="file"] {
+            width: 100%;
+            padding: 10px 12px;
+            background: #0f172a;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 14px;
+        }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            padding: 13px;
+            background: var(--primary);
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .btn:hover { background: var(--primary-hover); }
+        .error { color: var(--danger); font-size: 14px; margin-top: 12px; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <div class="icon">📁</div>
+            <h1>Document Vault</h1>
+            <p class="subtitle">Envelope-encrypted storage with automated purge</p>
+        </div>
+
+        <div class="notice">
+            Files are encrypted with unique keys and deleted automatically after 7 days. Only PDF, JPEG, and PNG up to 10MB are permitted.
+        </div>
+
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+
+        <form method="POST" action="/upload/{{ upload_id }}" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+            <div class="form-group">
+                <label for="doc_type">Document Type</label>
+                <select id="doc_type" name="doc_type" required>
+                    <option value="passport">Passport</option>
+                    <option value="visa">Student Visa</option>
+                    <option value="admission_letter">University Admission Letter</option>
+                    <option value="other">Other Supporting Document</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="file">Choose Document File</label>
+                <input type="file" id="file" name="file" accept=".pdf,.png,.jpg,.jpeg" required>
+            </div>
+
+            <button type="submit" class="btn">Upload to Secure Vault</button>
+        </form>
+    </div>
+</body>
+</html>

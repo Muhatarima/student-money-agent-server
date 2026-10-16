@@ -169,6 +169,27 @@ async def test_over_daily_limit_is_rejected(client):
     assert result["reason"] == "over_daily_limit"
 
 
+async def test_proposal_rejected_before_quote_does_not_count_today(client, redis):
+    # It stayed CREATED and can never move money, so it must not use up the daily limit
+    user_id = uuid.uuid4()
+    rate = await redis.hgetall("rates:BDT_IDR")
+    await redis.delete("rates:BDT_IDR")
+    assert (await propose(client, user_id, amount="50000"))["reason"] == "rate_unavailable"
+    await redis.hset("rates:BDT_IDR", mapping=rate)
+    for _ in range(2):
+        assert (await propose(client, user_id, amount="50000"))["status"] == "pending_approval"
+
+
+async def test_approval_with_expired_quote_does_not_count_today(client, session):
+    # Nobody can approve it any more, so it must not use up the daily limit
+    user_id = uuid.uuid4()
+    for _ in range(2):
+        assert (await propose(client, user_id, amount="50000"))["status"] == "pending_approval"
+    past = datetime.now(UTC) - timedelta(seconds=1)
+    await session.execute(update(Quote).values(expires_at=past))
+    assert (await propose(client, user_id, amount="50000"))["status"] == "pending_approval"
+
+
 async def test_frozen_user_is_rejected(client, session):
     user_id = uuid.uuid4()
     session.add(Freeze(user_id=user_id))

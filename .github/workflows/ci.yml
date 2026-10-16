@@ -1,0 +1,76 @@
+# Lint + tests on every push and pull request. Each job is one green/red tick on GitHub.
+# The whole-system Docker test (tests/e2e) is not run here: it takes minutes and builds
+# 3 images. Run it on your laptop before merging (see MANUAL_TODO.md, step A5).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:  # a newer push to the same branch cancels the older run
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ./packages/contracts pytest ruff
+      # The contracts are frozen exactly as the handbook wrote them, so only real errors are
+      # checked there (syntax, undefined/unused names), not style. Their tests follow our style.
+      - run: ruff check --isolated --select E9,F packages/contracts
+      - run: ruff check --isolated --select E,F,I,B,UP --line-length 100 tests/contracts
+      - run: pytest -q tests/contracts
+
+  service:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # one red service doesn't hide the others' results
+      matrix:
+        service: [messaging, money, identity]
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app  # throwaway CI database, not a secret
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app" --health-interval 2s --health-timeout 5s
+          --health-retries 30
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements.txt
+      - name: Create the test databases
+        env:
+          PGPASSWORD: app
+        run: |
+          psql -h localhost -U app -d postgres -c "CREATE DATABASE money_test;"
+          psql -h localhost -U app -d postgres -c "CREATE DATABASE identity_test;"
+      - run: pip install -r requirements.txt
+      - run: ruff check .
+      - run: pytest -q
+      - name: policy.py must stay at 100% coverage
+        if: matrix.service == 'money'
+        run: pytest -q tests/test_policy.py --cov=app.policy --cov-report=term-missing --cov-fail-under=100

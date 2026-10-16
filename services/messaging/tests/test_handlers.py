@@ -198,3 +198,61 @@ async def test_typing_rates_goes_to_the_agent(llm):
     # Only the BUTTON skips the AI; the word "rates" is a normal question
     await handlers.handle_message(job("rates"))
     assert llm["calls"] == ["rates"]
+
+
+# --- Day 4: rate limit, size limit, files only via the secure link ---
+
+
+async def test_rate_limit_one_polite_reply_then_silence(llm):
+    for i in range(handlers.MAX_PER_MINUTE + 5):
+        await handlers.handle_message(job(f"message {i}"))
+    assert len(llm["calls"]) == handlers.MAX_PER_MINUTE
+    assert replies().count(handlers.TOO_FAST) == 1
+    assert len(whatsapp.fake_outbox) == handlers.MAX_PER_MINUTE + 1
+
+
+async def test_rate_limit_is_per_user(llm):
+    for _ in range(handlers.MAX_PER_MINUTE):
+        await handlers.handle_message(job())
+    other = job() | {"from": "8801700009999"}
+    await handlers.handle_message(other)
+    assert len(llm["calls"]) == handlers.MAX_PER_MINUTE + 1
+
+
+async def test_rate_limit_key_expires(llm, redis):
+    await handlers.handle_message(job())
+    [key] = await redis.keys("wa:rate:*")
+    assert 0 < await redis.ttl(key) <= 60
+
+
+async def test_too_long_text_is_refused(llm):
+    await handlers.handle_message(job("x" * (handlers.MAX_TEXT_CHARS + 1)))
+    assert llm["calls"] == []
+    assert replies() == [handlers.TOO_LONG]
+
+
+async def test_text_at_the_limit_is_fine(llm):
+    await handlers.handle_message(job("x" * handlers.MAX_TEXT_CHARS))
+    assert len(llm["calls"]) == 1
+
+
+@pytest.mark.parametrize("type_", ["image", "document", "audio", "video", "sticker"])
+async def test_files_get_the_secure_upload_link(llm, type_):
+    await handlers.handle_message(job(text="", type_=type_))
+    assert llm["calls"] == []
+    [message] = whatsapp.fake_outbox
+    assert message["interactive"]["body"]["text"] == handlers.UPLOAD_ONLY
+    url = message["interactive"]["action"]["parameters"]["url"]
+    assert url == "http://localhost:8003/upload/demo"
+
+
+@pytest.mark.parametrize("word", ["UPLOAD", "upload"])
+async def test_upload_word_gets_the_secure_link(llm, word):
+    await handlers.handle_message(job(word))
+    assert llm["calls"] == []
+    assert replies() == [handlers.UPLOAD_ONLY]
+
+
+async def test_unlinked_user_sending_a_file_gets_the_welcome_link(new_user, llm):
+    await handlers.handle_message(job(text="", type_="image"))
+    assert replies() == [handlers.WELCOME]

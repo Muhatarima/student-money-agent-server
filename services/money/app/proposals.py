@@ -112,6 +112,9 @@ async def build_context(
     mandate: Mandate | None = None,
 ) -> PolicyContext:
     """Collect every fact the policy engine needs. Raises RateStale."""
+    # One limit check per user at a time, until the caller commits. Without this, two
+    # proposals at the same moment both see "spent 0" and both pass the daily limit.
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(str(transfer.user_id)))))
     now = datetime.now(UTC)
     rate = await get_rate(redis, quote.pair)
     ctx = PolicyContext(

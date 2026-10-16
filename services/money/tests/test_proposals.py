@@ -1,3 +1,5 @@
+import asyncio
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -5,11 +7,12 @@ from decimal import Decimal
 
 import httpx
 import pytest
-from contracts.models import ApprovalCreated
+from contracts.models import ApprovalCreated, TransferProposal
 from fakeredis import FakeAsyncRedis
-from sqlalchemy import update
+from sqlalchemy import pool, update
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
-from app import identity_client, main
+from app import identity_client, main, proposals
 from app.config import settings
 from app.db import get_session
 from app.models import Freeze, Quote, Recipient, Transfer, TransferState
@@ -407,3 +410,21 @@ async def test_freeze_money_route(client, session):
     response = await client.post(f"/internal/users/{user_id}/freeze-money")
     assert response.json() == {"frozen": True}
     assert await session.get(Freeze, user_id) is not None
+
+
+async def test_concurrent_proposals_cannot_beat_the_daily_limit(migrated_db, redis, identity):
+    # Real race: separate DB connections. 3 x 40000 at once; the daily limit (100000) fits 2.
+    engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=pool.NullPool)
+    user_id = uuid.uuid4()
+
+    async def propose_once():
+        async with AsyncSession(engine, expire_on_commit=False) as session:  # like SessionLocal
+            body = transfer_body(user_id, amount="40000")
+            proposal = TransferProposal.model_validate(body)
+            return (await proposals.propose_transfer(session, redis, proposal)).status
+
+    try:
+        results = await asyncio.gather(*[propose_once() for _ in range(3)])
+    finally:
+        await engine.dispose()
+    assert sorted(results) == ["pending_approval", "pending_approval", "rejected"]

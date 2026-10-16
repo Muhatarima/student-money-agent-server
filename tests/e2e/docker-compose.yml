@@ -1,0 +1,127 @@
+# The whole system for the end-to-end demo test. Started and stopped by conftest.py.
+# Every value here is a TEST-ONLY placeholder: never reuse any of them anywhere else.
+# Host ports are 180xx so this never clashes with services you run by hand on 800x.
+
+x-internal: &internal
+  INTERNAL_API_KEY: e2e-internal-key
+  REDIS_URL: redis://redis:6379/0
+
+x-messaging: &messaging
+  build: { context: ../.., dockerfile: services/messaging/Dockerfile }
+  environment: &messaging-env
+    <<: *internal
+    WA_VERIFY_TOKEN: e2e-verify-token
+    WA_APP_SECRET: e2e-app-secret
+    PHONE_HASH_KEY: e2e-phone-hash-key
+    MONEY_URL: http://money-api:8002
+    IDENTITY_URL: http://identity-api:8003
+    WA_FAKE_SEND: "true"  # never sends real WhatsApp messages
+    WA_FAKE_SEND_URL: http://fake-whatsapp:8009/fake-whatsapp/send
+    ANTHROPIC_API_KEY: e2e-fake-key
+    ANTHROPIC_BASE_URL: http://fake-llm:8010  # the scripted fake, not the real API
+  depends_on:
+    identity-api: { condition: service_healthy }
+    money-api: { condition: service_healthy }
+
+x-money: &money
+  build: { context: ../.., dockerfile: services/money/Dockerfile }
+  environment:
+    <<: *internal
+    ENV: dev  # turns on POST /dev/seed (test money for the demo user)
+    DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/money
+    IDENTITY_URL: http://identity-api:8003
+    MOCK_FAILURE_RATE: "0"  # the demo must be predictable
+    MOCK_TIMEOUT_RATE: "0"
+
+x-identity: &identity
+  build: { context: ../.., dockerfile: services/identity/Dockerfile }
+  environment:
+    <<: *internal
+    ENV: dev
+    DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/identity
+    MONEY_URL: http://money-api:8002
+    PUBLIC_BASE_URL: http://localhost:18003  # what the test's "browser" opens
+    RP_ID: localhost
+    FERNET_KEY: EPPHFoeyLi8hjtDKqIwoWZWW4BUYaHduTRfTazl9b6M=
+    VAULT_MASTER_KEY: 1MD7xvUxr97fbcKPoY6N08VkzT4BBVlXjpKLHfEX0SU=
+    SESSION_SECRET: e2e-session-secret
+    STORAGE_BACKEND: local
+  volumes: ["vault:/srv/services/identity/vault_local"]  # api and jobs share the files
+
+x-health: &health
+  interval: 2s
+  timeout: 5s
+  retries: 60
+
+services:
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: postgres }
+    volumes: ["./initdb.sql:/docker-entrypoint-initdb.d/initdb.sql:ro"]
+    healthcheck: { <<: *health, test: ["CMD", "pg_isready", "-U", "app"] }
+
+  redis:
+    image: redis:7
+    healthcheck: { <<: *health, test: ["CMD", "redis-cli", "ping"] }
+
+  money-api:
+    <<: *money
+    ports: ["18002:8002"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8002/health')"]
+
+  money-jobs:
+    <<: *money
+    command: ["python", "-m", "app.jobs"]
+    depends_on: { money-api: { condition: service_healthy } }  # migrations ran
+
+  identity-api:
+    <<: *identity
+    ports: ["18003:8003"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8003/health')"]
+
+  identity-jobs:
+    <<: *identity
+    command: ["python", "-m", "app.jobs"]
+    depends_on: { identity-api: { condition: service_healthy } }
+
+  messaging-api:
+    <<: *messaging
+    ports: ["18001:8001"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8001/health')"]
+
+  messaging-worker:
+    <<: *messaging
+    command: ["python", "-m", "app.worker"]
+
+  messaging-notifier:
+    <<: *messaging
+    command: ["python", "-m", "app.notifier"]
+
+  # Fake WhatsApp: catches every message the worker and notifier "send"
+  fake-whatsapp:
+    <<: *messaging
+    command: ["uvicorn", "mock_server:app", "--host", "0.0.0.0", "--port", "8009"]
+    ports: ["18009:8009"]
+    depends_on: {}
+
+  # Fake Anthropic API with scripted answers (see fake_llm.py)
+  fake-llm:
+    <<: *messaging
+    command: ["uvicorn", "fake_llm:app", "--app-dir", "/srv/e2e", "--host", "0.0.0.0", "--port", "8010"]
+    volumes: ["./fake_llm.py:/srv/e2e/fake_llm.py:ro"]
+    depends_on: {}
+
+volumes:
+  vault:

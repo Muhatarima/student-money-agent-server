@@ -3,9 +3,9 @@
 Per-service history from the earlier session: `services/messaging/PROGRESS.md`.
 
 ## Current phase
-Phases 1 to 4 are **done**. Now: Phase 5 (new branch `build/integration`).
+Phases 1 to 5 are **done**. Now: Phase 6 (deployment prep, on `build/integration`).
 
-This file lives only on `a-day1-autonomous` (so Phase 5's merge doesn't conflict).
+From Phase 5 on, this file is updated on `build/integration`.
 
 ## Phase 1: quick fixes (branch `a-day1-autonomous`)
 
@@ -85,21 +85,63 @@ Decisions to review:
 - The venv is Python 3.14 (no 3.12 on this machine); the Docker image uses 3.12.
 - The README for identity is in Phase 6.
 
-## Test results
-- messaging (`a-day1-autonomous`): `pytest -q` → 167 passed; `ruff check .` clean
-- money (`build/money`): `pytest -q` → 285 passed; `ruff check .` clean; `policy.py` 100%
-  coverage; `alembic check` (on money_test): no differences. Needs Docker Postgres + Redis.
-- identity (`build/identity`): `pytest -q` → 122 passed (97% coverage); `ruff check .` clean;
-  `alembic check`: no differences. Needs Docker Postgres (`identity_test`).
+## Phase 5: integration (branch `build/integration`, pushed)
+
+`build/integration` = `build/identity` + `a-day1-autonomous` (merge `51610ac`; `build/money`
+is already inside both). After the merge: no conflict markers, `packages/contracts` identical
+to `build/money`, and all three suites passed before any change.
+
+| Commit | What |
+|---|---|
+| `1dbee8e` I-fix | Messaging's log filter kept the uvicorn access-log crash Identity had: it now masks each argument and keeps the args tuple. Test with uvicorn's real `AccessFormatter` |
+| `9252a37` I-fix | **One FREEZE = one WhatsApp message.** The notifier acks `frozen` events (Identity and Money each publish one) without sending, because the FREEZE handler already confirmed. **Fail-open bug fixed:** if Identity's freeze worked but Money's failed, the user was "frozen" in Identity, so a second FREEZE only got "your account is frozen" and Money was never frozen (rules kept running). FREEZE now always re-runs both freezes (safe to repeat) |
+| `5ef5696` I | `WA_FAKE_SEND_URL`: in fake mode, also POST each message to `mock_server.py`, so other processes (worker, notifier) can be seen. In `.env.example` |
+| `c60f7ad` I | Identity `purge(session, now=...)` + `purge_once()`, so the e2e can purge "as if 8 days later". The Docker image creates `vault_local/` so a shared dev volume is owned by the app user |
+| (this commit) | `tests/e2e`: the handbook demo on the real services in Docker |
+
+### tests/e2e (how it works)
+- `docker-compose.yml` starts all 7 processes (messaging api/worker/notifier, money api/jobs,
+  identity api/jobs) + Postgres + Redis + fake WhatsApp (`mock_server.py`) + `fake_llm.py`.
+  Host ports 18001-18009, so it never clashes with the dev stack. Test-only values only.
+- Fakes only at the edges: WhatsApp (`WA_FAKE_SEND=true`), the LLM (`ANTHROPIC_BASE_URL`
+  points at the scripted `fake_llm.py`; the agent code is real), MockProvider (failure and
+  timeout rates 0), and the fingerprint sensor: `passkey.py` is a software passkey that makes
+  real WebAuthn data, so Identity's real py_webauthn checks run. There is **no test bypass in
+  any service**.
+- `test_demo.py`: link -> rate question -> one-off conversion approved -> receipt + balances
+  -> rule signed -> mock rate raised -> auto-conversion -> FREEZE (exactly one message, then
+  nothing for 5 s) -> WhatsApp, Money proposals, rules and upload links are all blocked ->
+  document upload -> purge (the file is gone).
+- Run: `cd tests\e2e`, make a venv, `pip install -r requirements.txt`, `pytest -q`
+  (about 2 min; first build longer). `E2E_KEEP=1` leaves the containers up for logs.
+
+Decisions to review:
+- The demo uploads with a **second student**: Identity refuses upload links for frozen users
+  (C's design, fail closed), so the frozen student can't upload. The e2e checks that refusal.
+- The rule step waits for Money's 60 s rate loop (no test-only shortcut in the jobs).
+
+Findings not fixed (no service bug in the demo path):
+- MockProvider keeps its records in memory per process. The API and the jobs process each
+  have their own, so `reconcile` (jobs) can't see a transfer that timed out in the API: it
+  would stay SUBMITTED. It can never pay twice. A real provider keeps this state on its side,
+  so this only matters for the mock (that's why the e2e sets the timeout rate to 0).
+- Docker Desktop on this laptop sometimes pauses its whole VM (seen: 222 s with no health
+  checks at all). Two early runs failed on that. The test now uses 30 s timeouts and keeps
+  polling after a timeout; a pause longer than a step's wait can still fail it. Just rerun.
+
+## Test results (on `build/integration`)
+- messaging: `pytest -q` → 171 passed; `ruff check .` clean
+- money: `pytest -q` → 285 passed; `ruff check .` clean; `policy.py` 100% coverage.
+  Needs Docker Postgres + Redis.
+- identity: `pytest -q` → 123 passed; `ruff check .` clean. Needs Docker Postgres.
+- tests/e2e: `pytest -q` → 1 passed (the whole demo, about 2 min); `ruff check .` clean.
+  Needs Docker Desktop.
 
 ## Blocked
 None.
 
-## Notes for Phase 5
-- FREEZE must send the user exactly ONE message (today: Messaging's reply, plus a `frozen`
-  event from Identity AND one from Money).
-- Messaging's `app/logs.py` has the same uvicorn access-log bug identity had (it sets
-  `record.args = None`); fix it on the integration branch.
-
 ## Next step
-Phase 5: `git switch -c build/integration build/identity`, then merge `a-day1-autonomous`.
+Phase 6 (on `build/integration`): `.env.example` for money and identity (check every setting
+is listed), README per service, root DEPLOY.md with exact Railway + Cloudflare R2 steps for
+the 7 processes (the 3 Dockerfiles already exist; see the e2e compose for each command).
+Do NOT deploy.

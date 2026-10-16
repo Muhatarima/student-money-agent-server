@@ -7,8 +7,10 @@ from decimal import Decimal
 import httpx
 import pytest
 from contracts.models import Currency, RuleProposal, TransferProposal
+from pydantic import SecretStr
 
 from app.clients import IdentityClient, MoneyClient, ServiceUnavailable
+from app.config import settings
 from tests.mocks import mock_identity, mock_money
 
 USER = uuid.uuid4()
@@ -139,3 +141,11 @@ async def test_5xx_is_service_unavailable():
     broken = httpx.MockTransport(lambda request: httpx.Response(503))
     with pytest.raises(ServiceUnavailable):
         await IdentityClient(transport=broken).get_user_by_phone("a" * 64)
+
+
+async def test_mock_with_empty_configured_key_blocks_everyone(monkeypatch):
+    monkeypatch.setattr(settings, "internal_api_key", SecretStr(""))
+    transport = httpx.ASGITransport(app=mock_money.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://m") as client:
+        response = await client.get(f"/internal/balance/{USER}", headers={"X-Internal-Key": ""})
+    assert response.status_code == 401

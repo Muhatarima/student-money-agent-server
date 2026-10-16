@@ -1,33 +1,27 @@
 import hashlib
 import hmac
 import json
-import os
+import logging
 
-import redis.asyncio as redis
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-load_dotenv()  # reads .env into environment variables
+from app.config import settings
+from app.dedupe import forget, is_duplicate
+from app.logs import setup_logging
+from app.queue import enqueue_incoming
+from app.redis_client import redis
+from app.security import mask_phone
 
-VERIFY_TOKEN = os.environ["WA_VERIFY_TOKEN"]
-APP_SECRET = os.environ["WA_APP_SECRET"].encode()  # hmac needs bytes
-
-r = redis.from_url(os.environ["REDIS_URL"], decode_responses=True, protocol=2)
-
-QUEUE = "queue:incoming"
+setup_logging()
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="Student Money Agent")
 
+MAX_BODY_BYTES = 1_000_000  # real WhatsApp webhooks are a few KB
+
 
 # ---------- helpers ----------
-async def is_duplicate(msg_id: str) -> bool:
-    # nx=True: only set if the key doesn't exist yet (atomic check-and-save)
-    # ex=86400: Redis forgets the ID after 24 hours
-    was_new = await r.set(f"wa:msg:{msg_id}", "1", nx=True, ex=86400)
-    return not was_new
-
-
 def extract_messages(data: dict) -> list[dict]:
     # WhatsApp nests messages: entry -> changes -> value -> messages
     messages = []
@@ -41,19 +35,27 @@ async def enqueue_message(msg: dict) -> None:
     job = {
         "msg_id": msg["id"],
         "from": msg.get("from", ""),
+        "type": msg.get("type", ""),
         "text": msg.get("text", {}).get("body", ""),
+        # Tapped reply button (our menu): its id, e.g. "rates"
+        "button_id": msg.get("interactive", {}).get("button_reply", {}).get("id", ""),
     }
     try:
-        await r.lpush(QUEUE, json.dumps(job))  # add to the queue
+        await enqueue_incoming(job)
     except Exception:
         # If queuing fails, forget the ID so Meta's retry is NOT treated as a duplicate
-        await r.delete(f"wa:msg:{msg['id']}")
+        await forget(msg["id"])
         raise  # -> 500 -> Meta retries later
 
 
 # ---------- routes ----------
 @app.get("/health")
-def health():
+async def health():
+    # Without Redis we can't queue messages, so report unhealthy
+    try:
+        await redis.ping()
+    except Exception:
+        return JSONResponse({"status": "redis_unavailable"}, status_code=503)
     return {"status": "ok"}
 
 
@@ -65,7 +67,8 @@ def verify_webhook(
     challenge: str = Query(alias="hub.challenge"),
 ):
     # compare_digest = constant-time compare (stops timing attacks)
-    if mode == "subscribe" and hmac.compare_digest(token, VERIFY_TOKEN):
+    verify_token = settings.wa_verify_token.get_secret_value()
+    if mode == "subscribe" and hmac.compare_digest(token, verify_token):
         return PlainTextResponse(challenge)  # echo back = "yes, this URL is mine"
     raise HTTPException(status_code=403, detail="Verification failed")
 
@@ -73,9 +76,14 @@ def verify_webhook(
 # ---- Lock 2: signature check + duplicate blocking + queue ----
 @app.post("/webhook")
 async def receive_webhook(request: Request):
+    if int(request.headers.get("content-length") or 0) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Body too large")
     raw_body = await request.body()  # exact bytes, before any parsing
+    if len(raw_body) > MAX_BODY_BYTES:  # no content-length header (chunked upload)
+        raise HTTPException(status_code=413, detail="Body too large")
     received_sig = request.headers.get("X-Hub-Signature-256", "")
-    expected_sig = "sha256=" + hmac.new(APP_SECRET, raw_body, hashlib.sha256).hexdigest()
+    app_secret = settings.wa_app_secret.get_secret_value().encode()  # hmac needs bytes
+    expected_sig = "sha256=" + hmac.new(app_secret, raw_body, hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(received_sig, expected_sig):
         raise HTTPException(status_code=401, detail="Bad signature")
@@ -86,12 +94,11 @@ async def receive_webhook(request: Request):
     for msg in extract_messages(data):
         if await is_duplicate(msg["id"]):
             dup_count += 1
-            print(f"🔁 Duplicate ignored: {msg['id']}")
+            log.info("duplicate ignored: %s", msg["id"])
             continue
         new_count += 1
         await enqueue_message(msg)
-        sender = "****" + msg.get("from", "")[-4:]  # never log full phone numbers
-        print(f"📥 Queued message from {sender}")
+        log.info("queued message from %s", mask_phone(msg.get("from", "")))
 
     # Always answer 200 for genuine messages, even duplicates,
     # otherwise Meta keeps retrying.

@@ -56,7 +56,10 @@ async def _send(to: str, message: dict) -> None:
             try:
                 response = await client.post(url, json=payload, headers=headers)
                 if response.status_code < 500:
-                    response.raise_for_status()  # 4xx = our mistake, retrying won't help
+                    if response.is_error:  # 4xx = our mistake, retrying won't help
+                        error = response.json().get("error", {})
+                        code, reason = error.get("code"), error.get("message")
+                        raise RuntimeError(f"Meta refused ({response.status_code}): {code} {reason}")
                     return
             except httpx.TransportError:  # timeouts and connection errors
                 if attempt == MAX_ATTEMPTS:

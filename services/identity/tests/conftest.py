@@ -69,3 +69,26 @@ async def session(conn: AsyncConnection) -> AsyncIterator[AsyncSession]:
         bind=conn, expire_on_commit=False, join_transaction_mode="create_savepoint"
     ) as s:
         yield s
+
+
+# --- HTTP client against the app, using the test's DB session ---
+
+import httpx  # noqa: E402
+
+from app.db import get_session  # noqa: E402
+from app.main import app  # noqa: E402
+
+KEY = {"X-Internal-Key": "test-key"}
+ORIGIN = {"Origin": "http://localhost:8003"}  # what a browser on our own pages sends
+
+
+@pytest.fixture
+async def client(session) -> AsyncIterator[httpx.AsyncClient]:
+    async def test_session():
+        yield session
+
+    app.dependency_overrides[get_session] = test_session
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8003") as c:
+        yield c
+    app.dependency_overrides.clear()

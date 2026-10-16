@@ -1,0 +1,13 @@
+# Only used for services/messaging/Dockerfile (doesn't affect the other services)
+**/.env
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/*.egg-info
+.git
+docs
+services/money
+services/identity
+services/messaging/tests

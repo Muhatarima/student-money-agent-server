@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 
@@ -99,12 +100,14 @@ async def test_unreadable_job_goes_to_dead_queue(redis, handled):
     assert handled["ids"] == []
 
 
-async def test_handler_never_logs_message_text(capsys, monkeypatch):
+async def test_handler_never_logs_message_text(caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+
     async def fake_handle_message(job):
         pass
 
     monkeypatch.setattr(worker.handlers, "handle_message", fake_handle_message)
     await worker.handle({"msg_id": "wamid.X", "from": "8801700001234", "text": "secret text"})
-    out = capsys.readouterr().out
+    out = caplog.text
     assert "secret text" not in out
     assert "8801700001234" not in out and "****1234" in out

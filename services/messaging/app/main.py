@@ -1,14 +1,19 @@
 import hashlib
 import hmac
 import json
+import logging
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from app.config import settings
 from app.dedupe import forget, is_duplicate
+from app.logs import setup_logging
 from app.queue import enqueue_incoming
 from app.security import mask_phone
+
+setup_logging()
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="Student Money Agent")
 
@@ -77,11 +82,11 @@ async def receive_webhook(request: Request):
     for msg in extract_messages(data):
         if await is_duplicate(msg["id"]):
             dup_count += 1
-            print(f"🔁 Duplicate ignored: {msg['id']}")
+            log.info("duplicate ignored: %s", msg["id"])
             continue
         new_count += 1
         await enqueue_message(msg)
-        print(f"📥 Queued message from {mask_phone(msg.get('from', ''))}")
+        log.info("queued message from %s", mask_phone(msg.get("from", "")))
 
     # Always answer 200 for genuine messages, even duplicates,
     # otherwise Meta keeps retrying.

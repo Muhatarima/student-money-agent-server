@@ -1,12 +1,16 @@
 import asyncio
 import json
+import logging
 
 from redis.exceptions import ConnectionError, TimeoutError
 
 from app import handlers
+from app.logs import setup_logging
 from app.queue import DEAD, INCOMING, PROCESSING
 from app.redis_client import redis as r
 from app.security import mask_phone
+
+log = logging.getLogger(__name__)
 
 BLOCK_SECONDS = 20  # must stay below the client's socket_timeout (30s)
 MAX_FAILURES = 3
@@ -14,9 +18,9 @@ MAX_FAILURES = 3
 
 async def handle(job: dict) -> None:
     # Never log the message text or the full phone number
-    print(f"⚙️  Processing {job['msg_id']} from {mask_phone(job['from'])}")
+    log.info("processing %s from %s", job["msg_id"], mask_phone(job["from"]))
     await handlers.handle_message(job)
-    print(f"✅ Done: {job['msg_id']}")
+    log.info("done: %s", job["msg_id"])
 
 
 async def recover() -> int:
@@ -41,7 +45,7 @@ async def process(raw: str) -> None:
         job = json.loads(raw)
         msg_id = job["msg_id"]
     except (ValueError, KeyError, TypeError):
-        print("☠️  Unreadable job moved to dead queue")
+        log.error("unreadable job moved to the dead queue")
         await move(raw, DEAD)
         return
 
@@ -52,10 +56,17 @@ async def process(raw: str) -> None:
         failures = await r.incr(failures_key)
         await r.expire(failures_key, 86400)
         if failures >= MAX_FAILURES:
-            print(f"☠️  {msg_id} failed {failures} times, moved to dead queue ({type(e).__name__})")
+            log.error(
+                "%s failed %d times, moved to the dead queue (%s)",
+                msg_id,
+                failures,
+                type(e).__name__,
+            )
             await move(raw, DEAD)
         else:
-            print(f"❌ {msg_id} failed ({type(e).__name__}), retry {failures}/{MAX_FAILURES - 1}")
+            log.warning(
+                "%s failed (%s), retry %d/%d", msg_id, type(e).__name__, failures, MAX_FAILURES - 1
+            )
             await move(raw, INCOMING)
         return
 
@@ -65,7 +76,7 @@ async def process(raw: str) -> None:
 
 async def main() -> None:
     recovered = await recover()
-    print(f"👷 Worker started ({recovered} job(s) recovered), waiting for jobs...")
+    log.info("worker started (%d job(s) recovered), waiting for jobs...", recovered)
     while True:
         try:
             # Atomically move one job from INCOMING to PROCESSING
@@ -73,7 +84,7 @@ async def main() -> None:
                 INCOMING, PROCESSING, timeout=BLOCK_SECONDS, src="RIGHT", dest="LEFT"
             )
         except (TimeoutError, ConnectionError) as e:
-            print(f"🔌 Redis hiccup ({type(e).__name__}), retrying in 2s...")
+            log.warning("Redis hiccup (%s), retrying in 2s...", type(e).__name__)
             await asyncio.sleep(2)
             continue
 
@@ -82,4 +93,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    setup_logging()
     asyncio.run(main())

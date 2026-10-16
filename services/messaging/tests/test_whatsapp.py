@@ -1,3 +1,5 @@
+import logging
+
 import httpx
 import pytest
 from pydantic import SecretStr
@@ -44,12 +46,13 @@ def meta(monkeypatch):
 # --- Fake mode (no token needed) ---
 
 
-async def test_send_text_fake(fake_mode, capsys):
+async def test_send_text_fake(fake_mode, caplog):
+    caplog.set_level(logging.INFO)
     await whatsapp.send_text(TO, "Hi 👋")
     assert fake_mode == [
         {"messaging_product": "whatsapp", "to": TO, "type": "text", "text": {"body": "Hi 👋"}}
     ]
-    out = capsys.readouterr().out
+    out = caplog.text
     assert "****1234" in out
     assert TO not in out and "Hi 👋" not in out  # no full phone, no text in logs
 
@@ -72,7 +75,8 @@ async def test_send_buttons_needs_1_to_3(fake_mode, count):
     assert fake_mode == []
 
 
-async def test_send_link_button_fake(fake_mode, capsys):
+async def test_send_link_button_fake(fake_mode, caplog):
+    caplog.set_level(logging.INFO)
     await whatsapp.send_link_button(TO, "Approve", "Review", "https://id.test/approve/abc")
     interactive = fake_mode[0]["interactive"]
     assert interactive["type"] == "cta_url"
@@ -80,7 +84,8 @@ async def test_send_link_button_fake(fake_mode, capsys):
         "name": "cta_url",
         "parameters": {"display_text": "Review", "url": "https://id.test/approve/abc"},
     }
-    assert "approve/abc" not in capsys.readouterr().out  # links can carry tokens
+    assert "[fake send]" in caplog.text
+    assert "approve/abc" not in caplog.text  # links can carry tokens
 
 
 # --- Real mode (fake Meta) ---

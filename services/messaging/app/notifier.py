@@ -16,6 +16,7 @@ from redis.exceptions import ResponseError
 
 from app import whatsapp
 from app.clients import IdentityClient
+from app.logs import setup_logging
 from app.redis_client import redis
 
 log = logging.getLogger(__name__)
@@ -164,5 +165,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    setup_logging()
     asyncio.run(main())

@@ -1,11 +1,14 @@
 """Send messages with the WhatsApp Cloud API. Never log the token, full phone or text."""
 
 import asyncio
+import logging
 
 import httpx
 
 from app.config import settings
 from app.security import mask_phone
+
+log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
 # Tests point this at a fake Meta; None = real network
@@ -37,7 +40,7 @@ async def _send(to: str, message: dict) -> None:
     payload = {"messaging_product": "whatsapp", "to": to} | message
     if settings.wa_fake_send:
         fake_outbox.append(payload)
-        print(f"📤 [fake send] {message['type']} to {mask_phone(to)}")
+        log.info("[fake send] %s to %s", message["type"], mask_phone(to))
         return
 
     token = settings.wa_access_token.get_secret_value()

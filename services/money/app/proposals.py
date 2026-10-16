@@ -225,6 +225,8 @@ async def propose_rule(session: AsyncSession, redis: Redis, rule: RuleProposal) 
     pair = f"{rule.from_currency.value}_{rule.to_currency.value}"
     if pair not in PAIRS:
         return rejected("pair_not_supported")
+    if rule.valid_until.tzinfo is None:
+        return rejected("valid_until_needs_timezone")
     if rule.valid_until <= datetime.now(UTC):
         return rejected("valid_until_in_past")
 

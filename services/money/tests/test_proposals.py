@@ -372,6 +372,8 @@ async def test_rule_reused_key_with_different_target_is_rejected(client):
     [
         ({"from_currency": "IDR", "to_currency": "BDT"}, "pair_not_supported"),
         ({"valid_until": "2020-01-01T00:00:00Z"}, "valid_until_in_past"),
+        # No timezone: we can't know when it ends, so refuse (was a 500 crash)
+        ({"valid_until": "2099-01-01T00:00:00"}, "valid_until_needs_timezone"),
     ],
 )
 async def test_bad_rule_is_rejected(client, changes, reason):

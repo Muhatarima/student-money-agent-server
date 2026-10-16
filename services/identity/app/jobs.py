@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import audit
 from app.db import SessionLocal
+from app.logs import setup_logging
 from app.models import Approval, ApprovalState, Document, LinkToken, UploadLink
 from app.storage import storage
 
@@ -56,5 +57,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    setup_logging()
     asyncio.run(main())

@@ -35,7 +35,7 @@ from app.crypto import hash_token
 from app.db import get_session
 from app.models import LinkToken, Passkey, User
 from app.redis_client import redis
-from app.web import message_page, require_browser_json, templates
+from app.web import limit_verify, message_page, require_browser_json, templates
 
 router = APIRouter()
 
@@ -122,7 +122,10 @@ async def register_options(body: TokenIn, session: AsyncSession = Depends(get_se
 
 
 @router.post("/passkeys/register/verify", dependencies=[Depends(require_browser_json)])
-async def register_verify(body: CredentialIn, session: AsyncSession = Depends(get_session)):
+async def register_verify(
+    request: Request, body: CredentialIn, session: AsyncSession = Depends(get_session)
+):
+    await limit_verify(request, body.t)
     link = await valid_link_token(session, body.t, for_update=True)
     if link is None:
         raise HTTPException(410, "This link expired or was already used.")

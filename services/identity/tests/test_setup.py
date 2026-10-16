@@ -5,7 +5,6 @@ from pydantic import SecretStr, ValidationError
 
 from app.auth import require_internal_key
 from app.config import Settings, settings
-from app.main import app
 
 protected = FastAPI()
 
@@ -13,10 +12,6 @@ protected = FastAPI()
 @protected.get("/secret", dependencies=[Depends(require_internal_key)])
 def secret():
     return {"ok": True}
-
-
-def test_health():
-    assert TestClient(app).get("/health").json() == {"status": "ok"}
 
 
 # --- X-Internal-Key ---

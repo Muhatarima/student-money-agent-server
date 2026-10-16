@@ -1,11 +1,14 @@
 """Shared helpers for the public web pages (link, approve, upload)."""
 
+import time
 from pathlib import Path
 
 from fastapi import HTTPException, Request
 from fastapi.templating import Jinja2Templates
 
 from app.config import settings
+from app.crypto import hash_token
+from app.redis_client import redis
 
 templates = Jinja2Templates(directory=Path(__file__).parent.parent / "templates")
 
@@ -30,3 +33,21 @@ def require_browser_json(request: Request) -> None:
         raise HTTPException(403, "bad origin")
     if not request.headers.get("content-type", "").startswith("application/json"):
         raise HTTPException(415, "JSON only")
+
+
+VERIFY_PER_MINUTE = 10
+
+
+async def limit_verify(request: Request, subject: str) -> None:
+    """At most 10 passkey checks a minute per IP address and per link/approval."""
+    minute = int(time.time() // 60)
+    ip = request.client.host if request.client else "unknown"
+    for key in (
+        f"identity:rl:verify:ip:{ip}:{minute}",
+        f"identity:rl:verify:subject:{hash_token(subject)}:{minute}",  # tokens only as hashes
+    ):
+        count = await redis.incr(key)
+        if count == 1:
+            await redis.expire(key, 60)
+        if count > VERIFY_PER_MINUTE:
+            raise HTTPException(429, "Too many tries. Please wait a minute.")

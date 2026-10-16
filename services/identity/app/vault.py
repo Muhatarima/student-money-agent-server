@@ -30,7 +30,7 @@ from app.models import Document, UploadLink, User
 from app.passkeys import AuthFailed, CredentialIn, TokenIn, finish_auth, start_auth
 from app.redis_client import redis
 from app.storage import storage
-from app.web import message_page, require_browser_json, templates
+from app.web import limit_verify, message_page, require_browser_json, templates
 
 router = APIRouter()
 
@@ -137,7 +137,10 @@ async def upload_options(link_id: uuid.UUID, body: TokenIn, session=Depends(get_
 
 
 @router.post("/upload/{link_id}/verify", dependencies=[Depends(require_browser_json)])
-async def upload_verify(link_id: uuid.UUID, body: CredentialIn, session=Depends(get_session)):
+async def upload_verify(
+    request: Request, link_id: uuid.UUID, body: CredentialIn, session=Depends(get_session)
+):
+    await limit_verify(request, str(link_id))
     link = await _link_or_410(session, link_id, body.t)
     challenge = await redis.getdel(_challenge_key(link_id))  # works once only
     if challenge is None:

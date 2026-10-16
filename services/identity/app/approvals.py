@@ -28,7 +28,7 @@ from app.crypto import hash_token, new_token
 from app.db import get_session
 from app.models import Approval, ApprovalState, Signature, User
 from app.passkeys import AuthFailed, CredentialIn, TokenIn, finish_auth, start_auth
-from app.web import message_page, require_browser_json, templates
+from app.web import limit_verify, message_page, require_browser_json, templates
 
 router = APIRouter()
 
@@ -174,7 +174,10 @@ async def approve_options(approval_id: uuid.UUID, body: TokenIn, session=Depends
 
 
 @router.post("/approve/{approval_id}/verify", dependencies=[Depends(require_browser_json)])
-async def approve_verify(approval_id: uuid.UUID, body: CredentialIn, session=Depends(get_session)):
+async def approve_verify(
+    request: Request, approval_id: uuid.UUID, body: CredentialIn, session=Depends(get_session)
+):
+    await limit_verify(request, str(approval_id))
     approval = await _usable(session, approval_id, body.t, for_update=True)
     try:
         passkey = await finish_auth(

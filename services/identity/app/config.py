@@ -1,4 +1,4 @@
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.env == "production"
+
+    @model_validator(mode="after")
+    def _safe_in_production(self):
+        # Refuse to start with settings that are only OK on a laptop (fail closed)
+        if self.is_production and not self.public_base_url.startswith("https://"):
+            raise ValueError("PUBLIC_BASE_URL must start with https:// in production")
+        if self.is_production and self.storage_backend != "s3":
+            raise ValueError("STORAGE_BACKEND must be s3 in production (vault_local is dev only)")
+        return self
 
 
 settings = Settings()

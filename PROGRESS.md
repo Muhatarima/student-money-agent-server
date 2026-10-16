@@ -3,9 +3,28 @@
 Per-service history from the earlier session: `services/messaging/PROGRESS.md`.
 
 ## Current phase
-Phases 1 to 5 are **done**. Now: Phase 6 (deployment prep, on `build/integration`).
+**All 6 phases are done.** Everything is on `build/integration` (pushed). Nothing was
+deployed and nothing was committed to `main`. What's left is human-only: `MANUAL_TODO.md`.
 
-From Phase 5 on, this file is updated on `build/integration`.
+## Final summary
+- **What exists:** three services (messaging, money, identity) built to the handbook and
+  the three engineer guides, sharing `packages/contracts` (never changed). 7 processes from
+  3 Docker images.
+- **Proof it works:** every service's `pytest -q` passes, `ruff check .` is clean,
+  `policy.py` has 100% coverage, and `tests/e2e` plays the handbook demo on all 7 real
+  processes in Docker (link -> rate -> conversion approved -> receipt -> rule -> auto-run ->
+  FREEZE with exactly one message -> everything blocked -> upload -> purge).
+- **Safety properties tested:** the AI only reads, proposes or freezes; money can't move
+  twice (idempotency keys, never resubmit after a timeout); insert-only ledger and
+  append-only hash-chained audit log; approvals signed over exactly what the page showed;
+  fail closed on unknown/invalid input, an empty internal key, missing `ENV`, or an
+  unverifiable rule signature; secrets and phones masked in logs; documents encrypted
+  with their own key and purged after 7 days.
+- **Read these next:** `MANUAL_TODO.md` (your ordered checklist), `DEPLOY.md` (Railway +
+  R2 recipe), each `services/*/README.md`, and "Decisions to review" in each phase below.
+- **Known limits (not bugs in the demo path):** money moves only through the fake
+  `MockProvider` (its records are per process, see Phase 5); no CI workflow yet (the
+  handbook's Day 0 asks for `.github/workflows/ci.yml`; it wasn't in the finish phases).
 
 ## Phase 1: quick fixes (branch `a-day1-autonomous`)
 
@@ -129,19 +148,35 @@ Findings not fixed (no service bug in the demo path):
   checks at all). Two early runs failed on that. The test now uses 30 s timeouts and keeps
   polling after a timeout; a pause longer than a step's wait can still fail it. Just rerun.
 
-## Test results (on `build/integration`)
+## Phase 6: deployment prep (branch `build/integration`, pushed)
+
+| Commit | What |
+|---|---|
+| `ffe4d70` D | Dockerfiles take `HOST` (default `0.0.0.0`, so Docker and the e2e are unchanged). On Railway `HOST=::` for `money-api` and `identity-api`, because Railway's private network uses IPv6 (smoke-tested in Docker: `::` answers on IPv6) |
+| `aa7c106` D | `README.md` in each service: processes, local run, settings, tests, Docker |
+| `e1cac21` D | Root `DEPLOY.md`: Railway (2 Postgres + Redis, 7 services, Dockerfile paths, start commands, healthchecks, 2 public domains only, a variables block per service with `${{...}}` references and the `postgresql+asyncpg://` URL), Cloudflare R2 (private bucket + bucket-only token), deploy order, checks, Meta webhook, production checklist, rollback, emergency global freeze, troubleshooting |
+| `ff9bd57` D | One root `MANUAL_TODO.md`: ordered checklist (A: laptop, B: online, C: before real money), each with do / why / where / check. The three service `MANUAL_TODO.md` files are merged into it and removed |
+
+The 7 processes come from 3 Dockerfiles, one image per service, with a different start command
+for each process (see the table at the top of `DEPLOY.md`). Each service's `.env.example`
+was checked against its `config.py`: every setting is listed.
+
+Decisions to review:
+- Production `MOCK_FAILURE_RATE=0` and `MOCK_TIMEOUT_RATE=0` in `DEPLOY.md`, so the demo on
+  production is predictable. Raise them to rehearse failures.
+- Production limits suggested: `MAX_PER_TX_BDT=5000`, `MAX_PER_DAY_BDT=10000`.
+
+## Test results (on `build/integration`, final)
 - messaging: `pytest -q` → 171 passed; `ruff check .` clean
 - money: `pytest -q` → 285 passed; `ruff check .` clean; `policy.py` 100% coverage.
-  Needs Docker Postgres + Redis.
-- identity: `pytest -q` → 123 passed; `ruff check .` clean. Needs Docker Postgres.
-- tests/e2e: `pytest -q` → 1 passed (the whole demo, about 2 min); `ruff check .` clean.
+  Needs Docker Postgres (`money_test`) + Redis.
+- identity: `pytest -q` → 123 passed; `ruff check .` clean. Needs Docker Postgres (`identity_test`).
+- tests/e2e: `pytest -q` → 1 passed in 2 min 6 s on freshly built images; `ruff check .` clean.
   Needs Docker Desktop.
 
 ## Blocked
 None.
 
 ## Next step
-Phase 6 (on `build/integration`): `.env.example` for money and identity (check every setting
-is listed), README per service, root DEPLOY.md with exact Railway + Cloudflare R2 steps for
-the 7 processes (the 3 Dockerfiles already exist; see the e2e compose for each command).
-Do NOT deploy.
+Human-only: work through `MANUAL_TODO.md` from A1. Code work, if wanted later: a GitHub
+Actions CI workflow (handbook Day 0) and a real licensed provider (handbook section 11).

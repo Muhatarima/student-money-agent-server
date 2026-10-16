@@ -3,7 +3,7 @@
 Per-service history from the earlier session: `services/messaging/PROGRESS.md`.
 
 ## Current phase
-Phases 1, 2 and 3 are **done**. Next: Phase 4 (new branch `build/identity` from `build/money`).
+Phases 1 to 4 are **done**. Now: Phase 5 (new branch `build/integration`).
 
 This file lives only on `a-day1-autonomous` (so Phase 5's merge doesn't conflict).
 
@@ -65,20 +65,41 @@ Decisions to review:
   one through the notifier.
 - README for messaging is Phase 6.
 
+## Phase 4: build Engineer C (branch `build/identity`, from `build/money`, pushed)
+
+| Commit | What |
+|---|---|
+| `7880d4f` C-step0 | Config with `hide_input_in_errors=True` and required `ENV`; an empty `INTERNAL_API_KEY` blocks every request; db, `/health` |
+| `eac28a3` C-step1.1 | Models + Alembic 0001 (unique token hashes / phone hash / credential id, partial index `documents(delete_after) WHERE deleted_at IS NULL`); 0002 append-only trigger on `audit_events`; hash-chained `audit()` + `verify_chain()` |
+| `91b5dae` C-step1.2 | `crypto.py` (Fernet wa_id, token hashes); by-phone, link-tokens (5/h per phone), wa-target, freeze (expires pending approvals, audit, `frozen` event) |
+| `bd312bb` C-step2 | Link page, passkey registration (challenge single-use in Redis, Origin + JSON-only checks), `start_auth` / `finish_auth`; `passkey.js` with `@simplewebauthn/browser@13.2.0` + SRI hash |
+| `e821a3e` C-step3 | Approvals: page shows exactly the summary + countdown; challenge = sha256(payload_hash + nonce); summary hash re-checked (a tampered summary can't be approved); single-use; frozen / expired / other user's passkey refused; confirms to Money; cancel |
+| `b5b5a08` C-step4 | `/internal/verify-signature` re-verifies the stored assertion every time, fail closed, audited; `mock_server.py` |
+| `4996695` C-step5.1 | Vault: upload links, passkey-gated page, signed strict HttpOnly cookie + CSRF, magic-byte check (pdf/jpeg/png), 10 MB, envelope encryption, local/S3 storage; `python -m app.jobs` purge |
+| `4b51acd` C-step5.2 | Security headers (CSP, HSTS in production, nosniff, no-referrer, DENY, no-store), 11 MB request cap, verify rate limits (10/min per IP and per link), token-masking logs, `/health` checks DB + Redis, production refuses http / local storage |
+| `58d33b0` C-step7.1 | Dockerfile (non-root, migrations on start, proxy headers; built and smoke-tested), `MANUAL_TODO.md`. The Docker smoke test found that the log filter broke uvicorn's access log; fixed + test |
+
+Decisions to review:
+- No `PHONE_HASH_KEY` in identity: it only ever receives hashes from Messaging.
+- Tests mock WebAuthn with a fake that still checks challenge, origin and which key signed.
+- The venv is Python 3.14 (no 3.12 on this machine); the Docker image uses 3.12.
+- The README for identity is in Phase 6.
+
 ## Test results
 - messaging (`a-day1-autonomous`): `pytest -q` → 167 passed; `ruff check .` clean
 - money (`build/money`): `pytest -q` → 285 passed; `ruff check .` clean; `policy.py` 100%
   coverage; `alembic check` (on money_test): no differences. Needs Docker Postgres + Redis.
+- identity (`build/identity`): `pytest -q` → 122 passed (97% coverage); `ruff check .` clean;
+  `alembic check`: no differences. Needs Docker Postgres (`identity_test`).
 
 ## Blocked
 None.
 
-## Notes for later phases
-- Phase 4: identity must refuse every request when its configured `INTERNAL_API_KEY` is
-  empty (like money and the messaging mocks), and use `hide_input_in_errors=True`.
-- Phase 4: identity publishes `account_linked` on `events:notify` (the notifier already
-  handles it).
+## Notes for Phase 5
+- FREEZE must send the user exactly ONE message (today: Messaging's reply, plus a `frozen`
+  event from Identity AND one from Money).
+- Messaging's `app/logs.py` has the same uvicorn access-log bug identity had (it sets
+  `record.args = None`); fix it on the integration branch.
 
 ## Next step
-Phase 4: `git switch -c build/identity build/money`, then follow
-`docs/engineer-C-identity-web-vault.md` from Step 0.
+Phase 5: `git switch -c build/integration build/identity`, then merge `a-day1-autonomous`.

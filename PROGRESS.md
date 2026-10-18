@@ -202,3 +202,13 @@ None.
 Human-only: work through `MANUAL_TODO.md` from A1 (B1 now includes checking the green CI
 run and making it required for `main`). Code work, if wanted later: a real licensed provider
 (handbook section 11).
+
+## Merge with main (branch `build/merge-main`, pushed)
+A teammate pushed a separate identity service (C-day0..7 + BUG-1..12) straight to `main`.
+`5e5884e` merges it, keeping this branch's identity service (the one wired to messaging and
+money); main's version stays in history at `795a3df`. Kept main's root README, `.dockerignore`
+and `packages/contracts/tests` (CI skips linting that folder: unused import, contracts frozen).
+Tests after the merge: messaging 171 passed, money 285 passed, identity 123 passed, e2e 1 passed.
+
+## Next step
+Pull request `build/merge-main` -> `main`, merge when CI is green, then `DEPLOY.md` steps 1-8.

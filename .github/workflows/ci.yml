@@ -25,7 +25,7 @@ jobs:
       - run: pip install ./packages/contracts pytest ruff
       # The contracts are frozen exactly as the handbook wrote them, so only real errors are
       # checked there (syntax, undefined/unused names), not style. Their tests follow our style.
-      - run: ruff check --isolated --select E9,F packages/contracts
+      - run: ruff check --isolated --select E9,F --exclude packages/contracts/tests packages/contracts
       - run: ruff check --isolated --select E,F,I,B,UP --line-length 100 tests/contracts
       - run: pytest -q tests/contracts
 

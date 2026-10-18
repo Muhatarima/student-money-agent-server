@@ -1,227 +1,268 @@
-import io
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from httpx import AsyncClient
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from cryptography.fernet import Fernet
+from sqlalchemy import select, update
 
-from app.crypto import encrypt_str
-from app.jobs import purge_expired_records
-from app.models import Approval, Document, LinkToken, User
-from app.storage import get_storage
-from app.vault import generate_csrf_token, sign_vault_session
-
-INTERNAL_KEY = "test-internal-key"
-HEADERS = {"X-Internal-Key": INTERNAL_KEY}
-
-# Minimal valid PDF header bytes
-PDF_BYTES = b"%PDF-1.4\n1 0 obj\n<<\n>>\nendobj\ntrailer\n<<\n>>\n%%EOF"
-PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4"
+from app import jobs, vault
+from app.config import settings
+from app.models import (
+    Approval,
+    ApprovalState,
+    AuditEvent,
+    Document,
+    LinkToken,
+    Passkey,
+    UploadLink,
 )
-# Fake EXE binary (MZ header)
-EXE_BYTES = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00"
+from app.storage import LocalStorage
+from tests.conftest import KEY, ORIGIN
+from tests.factories import make_user, phone_hash
+from tests.fake_webauthn import challenge_of, make_credential
+
+PDF = b"%PDF-1.7\n" + b"secret passport scan " * 50
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+EXE = b"MZ\x90\x00" + b"\x00" * 100  # a Windows program
 
 
-@pytest.mark.asyncio
-async def test_security_headers_present(client: AsyncClient):
-    res = await client.get("/health")
-    assert res.status_code == 200
-    assert "default-src 'self'" in res.headers["content-security-policy"]
-    assert res.headers["x-content-type-options"] == "nosniff"
-    assert res.headers["x-frame-options"] == "DENY"
-    assert res.headers["referrer-policy"] == "no-referrer"
+@pytest.fixture(autouse=True)
+def store(monkeypatch, tmp_path):
+    local = LocalStorage(tmp_path)
+    monkeypatch.setattr(vault, "storage", local)
+    monkeypatch.setattr(jobs, "storage", local)
+    return local
 
 
-@pytest.mark.asyncio
-async def test_create_upload_link(client: AsyncClient, db_session: AsyncSession):
-    user_id = uuid.uuid4()
-    user = User(
-        id=user_id,
-        phone_hash="vault_user_hash" * 4,
-        wa_id_encrypted=encrypt_str("8801700000099"),
-        linked=True,
+async def user_with_passkey(session):
+    user = await make_user(session)
+    cid = uuid.uuid4().bytes
+    session.add(Passkey(user_id=user.id, credential_id=cid, public_key=b"pk-" + cid))
+    await session.flush()
+    return user, cid
+
+
+async def new_upload_link(client, user):
+    response = await client.post(
+        "/internal/upload-links", json={"user_id": str(user.id)}, headers=KEY
     )
-    db_session.add(user)
-    await db_session.commit()
-
-    res = await client.post(
-        "/internal/upload-links",
-        json={"user_id": str(user_id)},
-        headers=HEADERS,
-    )
-    assert res.status_code == 200
-    data = res.json()
-    assert "/upload/" in data["url"]
+    assert response.status_code == 200, response.text
+    url = response.json()["url"]
+    return uuid.UUID(url.split("/upload/")[1].split("?")[0]), url.split("t=")[1]
 
 
-@pytest.mark.asyncio
-async def test_upload_without_session_rejected(client: AsyncClient):
-    upload_id = uuid.uuid4()
-    files = {"file": ("test.pdf", io.BytesIO(PDF_BYTES), "application/pdf")}
-    data = {"doc_type": "passport", "csrf_token": "some-csrf"}
-
-    res = await client.post(f"/upload/{upload_id}", data=data, files=files)
-    assert res.status_code == 401
+async def login(client, link_id, token, cid):
+    """Passkey check on the upload page. The client keeps the session cookie."""
+    options = await client.post(f"/upload/{link_id}/options", json={"t": token}, headers=ORIGIN)
+    credential = make_credential(challenge_of(options.json()), cid)
+    body = {"t": token, "credential": credential}
+    return await client.post(f"/upload/{link_id}/verify", json=body, headers=ORIGIN)
 
 
-@pytest.mark.asyncio
-async def test_upload_wrong_file_type_rejected(client: AsyncClient, db_session: AsyncSession):
-    user_id = uuid.uuid4()
-    user = User(
-        id=user_id,
-        phone_hash="vault_user_type" * 4,
-        wa_id_encrypted="enc",
-        linked=True,
-    )
-    db_session.add(user)
-    await db_session.commit()
-
-    upload_id = uuid.uuid4()
-    session_val = sign_vault_session(user_id)
-    csrf = generate_csrf_token(session_val)
-    client.cookies.set("vault_session", session_val)
-
-    # Renamed EXE as .pdf (magic bytes detection must catch this!)
-    files = {"file": ("malicious.pdf", io.BytesIO(EXE_BYTES), "application/pdf")}
-    data = {"doc_type": "passport", "csrf_token": csrf}
-
-    res = await client.post(f"/upload/{upload_id}", data=data, files=files)
-    assert res.status_code == 400
-    assert "Unsupported file type" in res.json()["detail"]
+async def logged_in(client, session):
+    user, cid = await user_with_passkey(session)
+    link_id, token = await new_upload_link(client, user)
+    assert (await login(client, link_id, token, cid)).status_code == 200
+    page = (await client.get(f"/upload/{link_id}?t={token}")).text
+    csrf = page.split('name="csrf" value="')[1].split('"')[0]
+    return user, link_id, token, csrf
 
 
-@pytest.mark.asyncio
-async def test_upload_too_large_rejected(client: AsyncClient, db_session: AsyncSession):
-    user_id = uuid.uuid4()
-    session_val = sign_vault_session(user_id)
-    csrf = generate_csrf_token(session_val)
-    client.cookies.set("vault_session", session_val)
-
-    # 11 MB fake payload
-    huge_payload = PDF_BYTES + b"0" * (11 * 1024 * 1024)
-    files = {"file": ("huge.pdf", io.BytesIO(huge_payload), "application/pdf")}
-    data = {"doc_type": "passport", "csrf_token": csrf}
-
-    res = await client.post(f"/upload/{uuid.uuid4()}", data=data, files=files)
-    assert res.status_code == 413
-
-
-@pytest.mark.asyncio
-async def test_upload_success_and_envelope_encryption(
-    client: AsyncClient, db_session: AsyncSession
-):
-    user_id = uuid.uuid4()
-    user = User(
-        id=user_id,
-        phone_hash="vault_user_good" * 4,
-        wa_id_encrypted="enc",
-        linked=True,
-    )
-    db_session.add(user)
-    await db_session.commit()
-
-    upload_id = uuid.uuid4()
-    session_val = sign_vault_session(user_id)
-    csrf = generate_csrf_token(session_val)
-    client.cookies.set("vault_session", session_val)
-
-    files = {"file": ("student_id.png", io.BytesIO(PNG_BYTES), "image/png")}
-    data = {"doc_type": "passport", "csrf_token": csrf}
-
-    res = await client.post(f"/upload/{upload_id}", data=data, files=files)
-    assert res.status_code == 200
-    assert "Document Stored Securely" in res.text
-
-    # Verify Document persisted in DB
-    stmt = select(Document).where(Document.user_id == user_id)
-    res_db = await db_session.execute(stmt)
-    doc = res_db.scalar_one()
-
-    assert doc.doc_type == "passport"
-    assert doc.wrapped_key is not None
-    assert doc.storage_key is not None
-    assert doc.size_bytes == len(PNG_BYTES)
-
-    # Verify bytes stored in storage backend
-    storage = get_storage()
-    stored_bytes = await storage.get(doc.storage_key)
-    # Stored bytes are encrypted (not plaintext PNG header)
-    assert stored_bytes != PNG_BYTES
-
-
-@pytest.mark.asyncio
-async def test_purge_expired_records(db_session: AsyncSession):
-    user_id = uuid.uuid4()
-    user = User(
-        id=user_id,
-        phone_hash="vault_user_purge" * 4,
-        wa_id_encrypted="enc",
-        linked=True,
-    )
-    db_session.add(user)
-
-    now = datetime.now(UTC)
-    storage = get_storage()
-    storage_key = f"purge-test-{uuid.uuid4()}"
-    await storage.put(storage_key, b"encrypted-document-payload")
-
-    # Document past delete_after
-    doc = Document(
-        id=uuid.uuid4(),
-        user_id=user_id,
-        doc_type="visa",
-        storage_key=storage_key,
-        wrapped_key=b"sample-wrapped-key",
-        content_type="application/pdf",
-        size_bytes=100,
-        delete_after=now - timedelta(days=1),
-        created_at=now - timedelta(days=8),
+async def send_file(client, link_id, token, csrf, data=PDF, doc_type="passport", headers=ORIGIN):
+    return await client.post(
+        f"/upload/{link_id}",
+        data={"t": token, "csrf": csrf, "doc_type": doc_type},
+        files={"file": ("my passport.pdf", data, "application/pdf")},
+        headers=headers,
     )
 
-    # Pending approval past expires_at
-    app_exp = Approval(
-        id=uuid.uuid4(),
-        user_id=user_id,
+
+# --- Upload links ---
+
+
+async def test_upload_link_needs_the_key(client, session):
+    user = await make_user(session)
+    response = await client.post("/internal/upload-links", json={"user_id": str(user.id)})
+    assert response.status_code == 401
+
+
+async def test_upload_link_refused_for_frozen_user(client, session):
+    user = await make_user(session, frozen=True)
+    response = await client.post(
+        "/internal/upload-links", json={"user_id": str(user.id)}, headers=KEY
+    )
+    assert response.status_code == 409
+
+
+async def test_page_first_asks_for_the_fingerprint(client, session):
+    user, _ = await user_with_passkey(session)
+    link_id, token = await new_upload_link(client, user)
+    page = (await client.get(f"/upload/{link_id}?t={token}")).text
+    assert "Confirm with fingerprint" in page and "<form" not in page
+
+
+async def test_wrong_token_page_is_410(client, session):
+    user, _ = await user_with_passkey(session)
+    link_id, _ = await new_upload_link(client, user)
+    assert (await client.get(f"/upload/{link_id}?t=wrong")).status_code == 410
+
+
+# --- Passkey session ---
+
+
+async def test_login_sets_a_strict_httponly_cookie(client, session):
+    user, cid = await user_with_passkey(session)
+    link_id, token = await new_upload_link(client, user)
+    response = await login(client, link_id, token, cid)
+    cookie = response.headers["set-cookie"]
+    assert "HttpOnly" in cookie and "SameSite=strict" in cookie and "Max-Age=600" in cookie
+    assert "Secure" not in cookie  # plain http://localhost in tests
+
+
+async def test_login_with_someone_elses_passkey_fails(client, session):
+    user, _ = await user_with_passkey(session)
+    _, other_cid = await user_with_passkey(session)
+    link_id, token = await new_upload_link(client, user)
+    assert (await login(client, link_id, token, other_cid)).status_code == 400
+
+
+async def test_upload_without_passkey_session_is_rejected(client, session):
+    user, _ = await user_with_passkey(session)
+    link_id, token = await new_upload_link(client, user)
+    response = await send_file(client, link_id, token, "anything")
+    assert response.status_code == 401
+
+
+async def test_wrong_csrf_is_rejected(client, session):
+    _, link_id, token, _ = await logged_in(client, session)
+    assert (await send_file(client, link_id, token, "wrong")).status_code == 403
+
+
+async def test_upload_from_another_site_is_rejected(client, session):
+    _, link_id, token, csrf = await logged_in(client, session)
+    evil = {"Origin": "https://evil.example"}
+    assert (await send_file(client, link_id, token, csrf, headers=evil)).status_code == 403
+
+
+# --- The upload ---
+
+
+async def test_pdf_is_stored_encrypted_with_its_own_key(client, session, store):
+    user, link_id, token, csrf = await logged_in(client, session)
+    response = await send_file(client, link_id, token, csrf)
+    assert response.status_code == 200 and "auto-deletes on" in response.text
+
+    doc = await session.scalar(select(Document).where(Document.user_id == user.id))
+    assert doc.doc_type == "passport" and doc.content_type == "application/pdf"
+    assert "passport" not in doc.storage_key  # random id, never the file name
+    stored = store.get(doc.storage_key)
+    assert b"secret passport scan" not in stored  # encrypted at rest
+    # Envelope: master key -> this document's key -> the file
+    master = Fernet(settings.vault_master_key.get_secret_value())
+    assert Fernet(master.decrypt(doc.wrapped_key)).decrypt(stored) == PDF
+    keep = doc.delete_after - datetime.now(UTC)
+    assert timedelta(days=6, hours=23) < keep <= timedelta(days=7)
+
+    event = await session.scalar(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(1))
+    assert event.action == "document.uploaded" and event.details == {"doc_type": "passport"}
+
+
+async def test_png_is_accepted(client, session):
+    _, link_id, token, csrf = await logged_in(client, session)
+    assert (await send_file(client, link_id, token, csrf, data=PNG)).status_code == 200
+
+
+async def test_exe_renamed_to_pdf_is_rejected(client, session, store):
+    _, link_id, token, csrf = await logged_in(client, session)
+    response = await send_file(client, link_id, token, csrf, data=EXE)
+    assert response.status_code == 415
+    assert list(store.root.iterdir()) == []  # nothing stored
+
+
+async def test_too_large_is_rejected(client, session):
+    _, link_id, token, csrf = await logged_in(client, session)
+    big = b"%PDF-1.7\n" + b"0" * vault.MAX_BYTES
+    assert (await send_file(client, link_id, token, csrf, data=big)).status_code == 413
+
+
+async def test_unknown_doc_type_is_rejected(client, session):
+    _, link_id, token, csrf = await logged_in(client, session)
+    response = await send_file(client, link_id, token, csrf, doc_type="bank_password")
+    assert response.status_code == 422
+
+
+async def test_link_is_single_use(client, session):
+    _, link_id, token, csrf = await logged_in(client, session)
+    assert (await send_file(client, link_id, token, csrf)).status_code == 200
+    assert (await send_file(client, link_id, token, csrf)).status_code == 410
+
+
+# --- Purge job ---
+
+
+async def test_purge_removes_file_and_wrapped_key(client, session, store):
+    user, link_id, token, csrf = await logged_in(client, session)
+    await send_file(client, link_id, token, csrf)
+    doc = await session.scalar(select(Document).where(Document.user_id == user.id))
+    await session.execute(
+        update(Document).where(Document.id == doc.id).values(delete_after=datetime.now(UTC))
+    )
+
+    await jobs.purge(session)
+    session.expunge_all()
+    doc = await session.get(Document, doc.id)
+    assert doc.wrapped_key is None and doc.deleted_at is not None
+    assert list(store.root.iterdir()) == []
+    actions = (await session.scalars(select(AuditEvent.action))).all()
+    assert "document.purged" in actions
+
+
+async def test_purge_keeps_documents_not_due_yet(client, session, store):
+    user, link_id, token, csrf = await logged_in(client, session)
+    await send_file(client, link_id, token, csrf)
+    await jobs.purge(session)
+    doc = await session.scalar(select(Document).where(Document.user_id == user.id))
+    assert doc.wrapped_key is not None and len(list(store.root.iterdir())) == 1
+
+
+async def test_purge_as_if_8_days_later_removes_a_new_document(client, session, store):
+    # The e2e demo uses this to "jump" past the 7-day auto-delete
+    user, link_id, token, csrf = await logged_in(client, session)
+    await send_file(client, link_id, token, csrf)
+    await jobs.purge(session, now=datetime.now(UTC) + timedelta(days=8))
+    session.expunge_all()
+    doc = await session.scalar(select(Document).where(Document.user_id == user.id))
+    assert doc.wrapped_key is None and list(store.root.iterdir()) == []
+
+
+async def test_purge_cleans_expired_links_and_approvals(session):
+    user = await make_user(session)
+    past = datetime.now(UTC) - timedelta(seconds=1)
+    session.add(
+        LinkToken(
+            token_hash=phone_hash(), phone_hash=phone_hash(), wa_id_encrypted="x", expires_at=past
+        )
+    )
+    session.add(UploadLink(user_id=user.id, token_hash=phone_hash(), expires_at=past))
+    approval = Approval(
+        user_id=user.id,
         kind="transfer",
         subject_id=uuid.uuid4(),
-        payload_hash="p" * 64,
-        summary={"amt": "100"},
-        token_hash="tok_purge_1" * 5,
-        nonce="n1",
-        expires_at=now - timedelta(minutes=5),
-        state="pending",
+        payload_hash="a" * 64,
+        summary={},
+        token_hash=phone_hash(),
+        nonce="n",
+        expires_at=past,
     )
+    session.add(approval)
+    await session.flush()
 
-    # Pending link token past expires_at
-    lt_exp = LinkToken(
-        id=uuid.uuid4(),
-        token_hash="tok_purge_2" * 5,
-        phone_hash="phone",
-        wa_id_encrypted="enc",
-        expires_at=now - timedelta(minutes=5),
-    )
-
-    db_session.add_all([doc, app_exp, lt_exp])
-    await db_session.commit()
-
-    # Run purge cycle
-    counts = await purge_expired_records(db_session)
-    assert counts["purged_documents"] >= 1
-    assert counts["expired_approvals"] >= 1
-    assert counts["expired_tokens"] >= 1
-
-    # Check that wrapped_key is zeroed out and deleted_at is set
-    await db_session.refresh(doc)
-    assert doc.wrapped_key is None
-    assert doc.deleted_at is not None
-
-    # Check that approval state is now expired
-    await db_session.refresh(app_exp)
-    assert app_exp.state == "expired"
-
-    # Check that storage file was deleted
-    with pytest.raises(FileNotFoundError):
-        await storage.get(storage_key)
+    await jobs.purge(session)
+    session.expunge_all()
+    assert (
+        await session.scalars(select(LinkToken).where(LinkToken.expires_at <= past))
+    ).all() == []
+    assert (
+        await session.scalars(select(UploadLink).where(UploadLink.user_id == user.id))
+    ).all() == []
+    assert (await session.get(Approval, approval.id)).state == ApprovalState.EXPIRED

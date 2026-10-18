@@ -15,7 +15,7 @@ from contracts.models import (
     TransferProposal,
 )
 from redis.asyncio import Redis
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,16 +50,31 @@ async def to_bdt(redis: Redis, currency: str, amount: Decimal) -> Decimal:
     return amount / (await get_rate(redis, f"BDT_{currency}")).rate
 
 
+def can_still_move_money():
+    """Which transfers count toward the limits (the query must join Quote).
+
+    Not CREATED (never got a quote), EXPIRED or FAILED, and not waiting for an
+    approval whose quote has run out (nobody can approve it any more)."""
+    return or_(
+        Transfer.state.in_([S.APPROVED, S.SUBMITTED, S.SETTLED]),
+        and_(
+            Transfer.state.in_([S.QUOTED, S.PENDING_APPROVAL]),
+            Quote.expires_at > datetime.now(UTC),
+        ),
+    )
+
+
 async def spent_today_bdt(session: AsyncSession, redis: Redis, transfer: Transfer) -> Decimal:
     """What the user already sent or is sending today (UTC), not counting this transfer."""
     midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     rows = await session.execute(
         select(Transfer.from_currency, func.sum(Transfer.amount))
+        .outerjoin(Quote, Quote.id == Transfer.quote_id)
         .where(
             Transfer.user_id == transfer.user_id,
             Transfer.id != transfer.id,
             Transfer.created_at >= midnight,
-            Transfer.state.not_in([S.EXPIRED, S.FAILED]),
+            can_still_move_money(),
         )
         .group_by(Transfer.from_currency)
     )
@@ -77,11 +92,13 @@ async def spent_this_month_bdt(session: AsyncSession, redis: Redis, transfer: Tr
     """What this transfer's rule already converted this month (UTC), not counting this one."""
     month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     total = await session.scalar(
-        select(func.coalesce(func.sum(Transfer.amount), 0)).where(
+        select(func.coalesce(func.sum(Transfer.amount), 0))
+        .outerjoin(Quote, Quote.id == Transfer.quote_id)
+        .where(
             Transfer.mandate_id == transfer.mandate_id,
             Transfer.id != transfer.id,
             Transfer.created_at >= month_start,
-            Transfer.state.not_in([S.EXPIRED, S.FAILED]),
+            can_still_move_money(),
         )
     )
     return await to_bdt(redis, transfer.from_currency, Decimal(total))
@@ -95,6 +112,9 @@ async def build_context(
     mandate: Mandate | None = None,
 ) -> PolicyContext:
     """Collect every fact the policy engine needs. Raises RateStale."""
+    # One limit check per user at a time, until the caller commits. Without this, two
+    # proposals at the same moment both see "spent 0" and both pass the daily limit.
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(str(transfer.user_id)))))
     now = datetime.now(UTC)
     rate = await get_rate(redis, quote.pair)
     ctx = PolicyContext(
@@ -205,6 +225,8 @@ async def propose_rule(session: AsyncSession, redis: Redis, rule: RuleProposal) 
     pair = f"{rule.from_currency.value}_{rule.to_currency.value}"
     if pair not in PAIRS:
         return rejected("pair_not_supported")
+    if rule.valid_until.tzinfo is None:
+        return rejected("valid_until_needs_timezone")
     if rule.valid_until <= datetime.now(UTC):
         return rejected("valid_until_in_past")
 

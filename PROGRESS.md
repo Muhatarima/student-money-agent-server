@@ -3,9 +3,29 @@
 Per-service history from the earlier session: `services/messaging/PROGRESS.md`.
 
 ## Current phase
-Phases 1 to 4 are **done**. Now: Phase 5 (new branch `build/integration`).
+**All 6 phases are done.** Everything is on `build/integration` (pushed). Nothing was
+deployed and nothing was committed to `main`. What's left is human-only: `MANUAL_TODO.md`.
 
-This file lives only on `a-day1-autonomous` (so Phase 5's merge doesn't conflict).
+## Final summary
+- **What exists:** three services (messaging, money, identity) built to the handbook and
+  the three engineer guides, sharing `packages/contracts` (never changed). 7 processes from
+  3 Docker images.
+- **Proof it works:** every service's `pytest -q` passes, `ruff check .` is clean,
+  `policy.py` has 100% coverage, and `tests/e2e` plays the handbook demo on all 7 real
+  processes in Docker (link -> rate -> conversion approved -> receipt -> rule -> auto-run ->
+  FREEZE with exactly one message -> everything blocked -> upload -> purge).
+- **Safety properties tested:** the AI only reads, proposes or freezes; money can't move
+  twice (idempotency keys, never resubmit after a timeout); insert-only ledger and
+  append-only hash-chained audit log; approvals signed over exactly what the page showed;
+  fail closed on unknown/invalid input, an empty internal key, missing `ENV`, or an
+  unverifiable rule signature; secrets and phones masked in logs; documents encrypted
+  with their own key and purged after 7 days.
+- **Read these next:** `MANUAL_TODO.md` (your ordered checklist), `DEPLOY.md` (Railway +
+  R2 recipe), each `services/*/README.md`, and "Decisions to review" in each phase below.
+- **CI:** `.github/workflows/ci.yml` runs ruff + pytest for the 3 services and the
+  contracts on every push and pull request (see "CI" below).
+- **Known limit (not a bug in the demo path):** money moves only through the fake
+  `MockProvider` (its records are per process, see Phase 5).
 
 ## Phase 1: quick fixes (branch `a-day1-autonomous`)
 
@@ -85,21 +105,110 @@ Decisions to review:
 - The venv is Python 3.14 (no 3.12 on this machine); the Docker image uses 3.12.
 - The README for identity is in Phase 6.
 
-## Test results
-- messaging (`a-day1-autonomous`): `pytest -q` → 167 passed; `ruff check .` clean
-- money (`build/money`): `pytest -q` → 285 passed; `ruff check .` clean; `policy.py` 100%
-  coverage; `alembic check` (on money_test): no differences. Needs Docker Postgres + Redis.
-- identity (`build/identity`): `pytest -q` → 122 passed (97% coverage); `ruff check .` clean;
-  `alembic check`: no differences. Needs Docker Postgres (`identity_test`).
+## Phase 5: integration (branch `build/integration`, pushed)
+
+`build/integration` = `build/identity` + `a-day1-autonomous` (merge `51610ac`; `build/money`
+is already inside both). After the merge: no conflict markers, `packages/contracts` identical
+to `build/money`, and all three suites passed before any change.
+
+| Commit | What |
+|---|---|
+| `1dbee8e` I-fix | Messaging's log filter kept the uvicorn access-log crash Identity had: it now masks each argument and keeps the args tuple. Test with uvicorn's real `AccessFormatter` |
+| `9252a37` I-fix | **One FREEZE = one WhatsApp message.** The notifier acks `frozen` events (Identity and Money each publish one) without sending, because the FREEZE handler already confirmed. **Fail-open bug fixed:** if Identity's freeze worked but Money's failed, the user was "frozen" in Identity, so a second FREEZE only got "your account is frozen" and Money was never frozen (rules kept running). FREEZE now always re-runs both freezes (safe to repeat) |
+| `5ef5696` I | `WA_FAKE_SEND_URL`: in fake mode, also POST each message to `mock_server.py`, so other processes (worker, notifier) can be seen. In `.env.example` |
+| `c60f7ad` I | Identity `purge(session, now=...)` + `purge_once()`, so the e2e can purge "as if 8 days later". The Docker image creates `vault_local/` so a shared dev volume is owned by the app user |
+| (this commit) | `tests/e2e`: the handbook demo on the real services in Docker |
+
+### tests/e2e (how it works)
+- `docker-compose.yml` starts all 7 processes (messaging api/worker/notifier, money api/jobs,
+  identity api/jobs) + Postgres + Redis + fake WhatsApp (`mock_server.py`) + `fake_llm.py`.
+  Host ports 18001-18009, so it never clashes with the dev stack. Test-only values only.
+- Fakes only at the edges: WhatsApp (`WA_FAKE_SEND=true`), the LLM (`ANTHROPIC_BASE_URL`
+  points at the scripted `fake_llm.py`; the agent code is real), MockProvider (failure and
+  timeout rates 0), and the fingerprint sensor: `passkey.py` is a software passkey that makes
+  real WebAuthn data, so Identity's real py_webauthn checks run. There is **no test bypass in
+  any service**.
+- `test_demo.py`: link -> rate question -> one-off conversion approved -> receipt + balances
+  -> rule signed -> mock rate raised -> auto-conversion -> FREEZE (exactly one message, then
+  nothing for 5 s) -> WhatsApp, Money proposals, rules and upload links are all blocked ->
+  document upload -> purge (the file is gone).
+- Run: `cd tests\e2e`, make a venv, `pip install -r requirements.txt`, `pytest -q`
+  (about 2 min; first build longer). `E2E_KEEP=1` leaves the containers up for logs.
+
+Decisions to review:
+- The demo uploads with a **second student**: Identity refuses upload links for frozen users
+  (C's design, fail closed), so the frozen student can't upload. The e2e checks that refusal.
+- The rule step waits for Money's 60 s rate loop (no test-only shortcut in the jobs).
+
+Findings not fixed (no service bug in the demo path):
+- MockProvider keeps its records in memory per process. The API and the jobs process each
+  have their own, so `reconcile` (jobs) can't see a transfer that timed out in the API: it
+  would stay SUBMITTED. It can never pay twice. A real provider keeps this state on its side,
+  so this only matters for the mock (that's why the e2e sets the timeout rate to 0).
+- Docker Desktop on this laptop sometimes pauses its whole VM (seen: 222 s with no health
+  checks at all). Two early runs failed on that. The test now uses 30 s timeouts and keeps
+  polling after a timeout; a pause longer than a step's wait can still fail it. Just rerun.
+
+## Phase 6: deployment prep (branch `build/integration`, pushed)
+
+| Commit | What |
+|---|---|
+| `ffe4d70` D | Dockerfiles take `HOST` (default `0.0.0.0`, so Docker and the e2e are unchanged). On Railway `HOST=::` for `money-api` and `identity-api`, because Railway's private network uses IPv6 (smoke-tested in Docker: `::` answers on IPv6) |
+| `aa7c106` D | `README.md` in each service: processes, local run, settings, tests, Docker |
+| `e1cac21` D | Root `DEPLOY.md`: Railway (2 Postgres + Redis, 7 services, Dockerfile paths, start commands, healthchecks, 2 public domains only, a variables block per service with `${{...}}` references and the `postgresql+asyncpg://` URL), Cloudflare R2 (private bucket + bucket-only token), deploy order, checks, Meta webhook, production checklist, rollback, emergency global freeze, troubleshooting |
+| `ff9bd57` D | One root `MANUAL_TODO.md`: ordered checklist (A: laptop, B: online, C: before real money), each with do / why / where / check. The three service `MANUAL_TODO.md` files are merged into it and removed |
+
+The 7 processes come from 3 Dockerfiles, one image per service, with a different start command
+for each process (see the table at the top of `DEPLOY.md`). Each service's `.env.example`
+was checked against its `config.py`: every setting is listed.
+
+Decisions to review:
+- Production `MOCK_FAILURE_RATE=0` and `MOCK_TIMEOUT_RATE=0` in `DEPLOY.md`, so the demo on
+  production is predictable. Raise them to rehearse failures.
+- Production limits suggested: `MAX_PER_TX_BDT=5000`, `MAX_PER_DAY_BDT=10000`.
+
+## CI (branch `build/integration`, pushed)
+
+| Commit | What |
+|---|---|
+| `3264bb6` CI | `.github/workflows/ci.yml` on every push and pull request. Job `contracts`: ruff + `pytest tests/contracts`. Job `service` (messaging, money, identity in parallel, with Postgres 16 + Redis 7 and the two `_test` databases): `pip install -r requirements.txt`, `ruff check .`, `pytest -q`; money also fails if `policy.py` drops below 100% coverage |
+
+- New `tests/contracts/test_contracts.py` (9 tests: hash ignores key order, a known-answer
+  hash that pins the algorithm, one digit changes the hash, Decimal amounts, bad proposals
+  rejected, event round trip). It lives outside `packages/contracts`, so the package is
+  unchanged.
+- Checked before pushing: every job's commands in `python:3.12-slim` on Linux, on a clean
+  `git archive` of the commit (no `.env`, no venvs), with fresh Postgres + Redis: all green.
+  (I also checked that no suite secretly relies on a local `.env`.)
+- `tests/e2e` is not in CI (several minutes, builds 3 images): run it locally before merging.
+
+Optional contract cleanup (style only, needs "contract change approved"): `contracts/hashing.py`
+has `import hashlib, json` on one line and `contracts/events.py` has a comment longer than 88
+characters. CI checks the contracts only for real errors (syntax, undefined/unused names) so
+these don't fail it.
+
+## Test results (on `build/integration`, final)
+- messaging: `pytest -q` → 171 passed; `ruff check .` clean
+- money: `pytest -q` → 285 passed; `ruff check .` clean; `policy.py` 100% coverage.
+  Needs Docker Postgres (`money_test`) + Redis.
+- identity: `pytest -q` → 123 passed; `ruff check .` clean. Needs Docker Postgres (`identity_test`).
+- tests/e2e: `pytest -q` → 1 passed in 2 min 6 s on freshly built images; `ruff check .` clean.
+  Needs Docker Desktop.
 
 ## Blocked
 None.
 
-## Notes for Phase 5
-- FREEZE must send the user exactly ONE message (today: Messaging's reply, plus a `frozen`
-  event from Identity AND one from Money).
-- Messaging's `app/logs.py` has the same uvicorn access-log bug identity had (it sets
-  `record.args = None`); fix it on the integration branch.
+## Next step
+Human-only: work through `MANUAL_TODO.md` from A1 (B1 now includes checking the green CI
+run and making it required for `main`). Code work, if wanted later: a real licensed provider
+(handbook section 11).
+
+## Merge with main (branch `build/merge-main`, pushed)
+A teammate pushed a separate identity service (C-day0..7 + BUG-1..12) straight to `main`.
+`5e5884e` merges it, keeping this branch's identity service (the one wired to messaging and
+money); main's version stays in history at `795a3df`. Kept main's root README, `.dockerignore`
+and `packages/contracts/tests` (CI skips linting that folder: unused import, contracts frozen).
+Tests after the merge: messaging 171 passed, money 285 passed, identity 123 passed, e2e 1 passed.
 
 ## Next step
-Phase 5: `git switch -c build/integration build/identity`, then merge `a-day1-autonomous`.
+Pull request `build/merge-main` -> `main`, merge when CI is green, then `DEPLOY.md` steps 1-8.

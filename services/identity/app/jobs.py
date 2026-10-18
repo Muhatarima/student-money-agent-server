@@ -1,92 +1,66 @@
+"""Background clean-up. Run with: python -m app.jobs (every 10 minutes)."""
+
 import asyncio
 import logging
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .audit import audit
-from .db import AsyncSessionLocal
-from .models import Approval, Document, LinkToken
-from .storage import get_storage
+from app.audit import audit
+from app.db import SessionLocal
+from app.logs import setup_logging
+from app.models import Approval, ApprovalState, Document, LinkToken, UploadLink
+from app.storage import storage
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("identity.jobs")
+log = logging.getLogger(__name__)
+
+EVERY_SECONDS = 600
 
 
-async def purge_expired_records(db: AsyncSession) -> dict[str, int]:
-    """Purge expired documents, tokens, and approvals.
+async def purge(session: AsyncSession, now: datetime | None = None) -> None:
+    # now can be set to a later time, e.g. the e2e demo purges "as if 8 days later"
+    now = now or datetime.now(UTC)
 
-    Deletes document bytes from storage, zeros out the wrapped_key, and records audit trails.
-    """
-    now = datetime.now(UTC)
-    storage = get_storage()
-
-    # 1. Purge documents past delete_after
-    stmt = select(Document).where(Document.delete_after <= now, Document.deleted_at.is_(None))
-    res = await db.execute(stmt)
-    expired_docs = res.scalars().all()
-
-    purged_doc_count = 0
-    for doc in expired_docs:
-        try:
-            await storage.delete(doc.storage_key)
-        except Exception as exc:
-            logger.warning("Failed to delete storage key %s: %s", doc.storage_key, exc)
-
-        doc.wrapped_key = None
-        doc.deleted_at = now
-        purged_doc_count += 1
-
-        await audit(
-            db,
-            actor="system:purge_job",
-            action="document.purged",
-            target=doc.user_id,
-            details={"doc_id": str(doc.id), "doc_type": doc.doc_type},
+    # 1. Documents past delete_after: delete the file AND destroy its key
+    expired_docs = await session.execute(
+        select(Document.id, Document.storage_key, Document.doc_type).where(
+            Document.deleted_at.is_(None), Document.delete_after <= now
         )
+    )
+    for doc_id, storage_key, doc_type in expired_docs.all():
+        await asyncio.to_thread(storage.delete, storage_key)
+        await session.execute(
+            update(Document).where(Document.id == doc_id).values(wrapped_key=None, deleted_at=now)
+        )
+        await audit(session, "system", "document.purged", str(doc_id), {"doc_type": doc_type})
+        await session.commit()  # one document at a time: a crash never loses track
 
-    # 2. Expire pending approvals past their expiration time
-    app_stmt = (
+    # 2. Expired one-time links can go; pending approvals past expiry become expired
+    await session.execute(delete(LinkToken).where(LinkToken.expires_at <= now))
+    await session.execute(delete(UploadLink).where(UploadLink.expires_at <= now))
+    await session.execute(
         update(Approval)
-        .where(Approval.expires_at <= now, Approval.state == "pending")
-        .values(state="expired")
+        .where(Approval.state == ApprovalState.PENDING, Approval.expires_at <= now)
+        .values(state=ApprovalState.EXPIRED)
     )
-    app_res = await db.execute(app_stmt)
-    expired_approvals_count = app_res.rowcount
-
-    # 3. Clean up expired link tokens
-    tok_stmt = (
-        update(LinkToken)
-        .where(LinkToken.expires_at <= now, LinkToken.used_at.is_(None))
-        .values(used_at=now)
-    )
-    tok_res = await db.execute(tok_stmt)
-    expired_tokens_count = tok_res.rowcount
-
-    await db.commit()
-
-    return {
-        "purged_documents": purged_doc_count,
-        "expired_approvals": expired_approvals_count,
-        "expired_tokens": expired_tokens_count,
-    }
+    await session.commit()
 
 
-async def run_worker() -> None:
-    """Continuous background worker executing the purge cycle every 10 minutes."""
-    logger.info("Starting identity background jobs worker (purge cycle: 10m)...")
+async def purge_once(now: datetime | None = None) -> None:
+    async with SessionLocal() as session:
+        await purge(session, now)
+
+
+async def main() -> None:
     while True:
         try:
-            async with AsyncSessionLocal() as session:
-                counts = await purge_expired_records(session)
-                if any(counts.values()):
-                    logger.info("Purge cycle completed: %s", counts)
-        except Exception as exc:
-            logger.error("Error during purge cycle: %s", exc)
-
-        await asyncio.sleep(600)
+            await purge_once()
+        except Exception:
+            log.exception("purge failed, will try again")  # one failure never stops the loop
+        await asyncio.sleep(EVERY_SECONDS)
 
 
 if __name__ == "__main__":
-    asyncio.run(run_worker())
+    setup_logging()
+    asyncio.run(main())

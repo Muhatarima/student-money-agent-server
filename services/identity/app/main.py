@@ -1,120 +1,59 @@
-import asyncio
-from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request, Response, status
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from .config import settings
-from .db import engine, get_db
-from .jobs import run_worker
-from .redis_client import redis_client
+from app import approvals, passkeys, signatures, users, vault
+from app.config import settings
+from app.db import engine
+from app.logs import setup_logging
+from app.redis_client import redis
 
-# ── Startup guard ─────────────────────────────────────────────────────────────
+HERE = Path(__file__).parent.parent
+# Uploads are max 10 MB; anything much bigger is refused before it is even read
+MAX_BODY_BYTES = 11 * 1024 * 1024
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Enforce HTTPS in production before accepting any traffic.
-    if settings.ENV == "production" and not settings.PUBLIC_BASE_URL.startswith("https://"):
-        raise RuntimeError(
-            "ENV=production but PUBLIC_BASE_URL is not https. "
-            "Set PUBLIC_BASE_URL to your Railway HTTPS domain."
-        )
-    # ISSUE-8 fix: start the background purge worker as an asyncio task so that
-    # expired documents, approvals, and link tokens are cleaned up automatically
-    # even in a single-process Railway deploy (no separate worker dyno needed).
-    purge_task = asyncio.create_task(run_worker())
-    yield
-    # Cancel the worker on shutdown and wait for it to exit cleanly.
-    purge_task.cancel()
-    try:
-        await purge_task
-    except asyncio.CancelledError:
-        pass
-    # Dispose DB connection pool on shutdown.
-    await engine.dispose()
-
-
-# ── App ───────────────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="Identity Service",
-    description="Users, passkeys, approvals, vault — Engineer C",
-    version="0.1.0",
-    lifespan=lifespan,
+CSP = (
+    "default-src 'self'; script-src 'self' https://unpkg.com; "
+    "frame-ancestors 'none'; form-action 'self'"
 )
 
-# ── Security Headers Middleware ───────────────────────────────────────────────
+setup_logging()
+
+app = FastAPI(title="Identity")
+app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+app.include_router(users.router)
+app.include_router(passkeys.router)
+app.include_router(approvals.router)
+app.include_router(signatures.router)
+app.include_router(vault.router)
 
 
 @app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    response: Response = await call_next(request)
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; script-src 'self' https://unpkg.com; "
-        "style-src 'self' 'unsafe-inline'; frame-ancestors 'none';"
-    )
+async def security_headers(request: Request, call_next):
+    if int(request.headers.get("content-length") or 0) > MAX_BODY_BYTES:
+        return JSONResponse({"detail": "Request too large"}, status_code=413)
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = CSP
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "no-referrer"  # page URLs carry tokens
     response.headers["X-Frame-Options"] = "DENY"
-
-    # Disallow caching on HTML pages to prevent sensitive data from persisting in browser cache
-    content_type = response.headers.get("content-type", "")
-    if "text/html" in content_type:
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-
-    if settings.ENV == "production":
+    if settings.is_production:
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-store"  # pages show personal data
     return response
 
 
-# Static files and Jinja2 templates
-templates = Jinja2Templates(directory="templates")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-# ── Health ────────────────────────────────────────────────────────────────────
-
-
-@app.get("/health", tags=["ops"])
-async def health(db: AsyncSession = Depends(get_db)) -> JSONResponse:
-    """Liveness & readiness check. Returns 200 when service, DB, and Redis are reachable."""
-    # Check Database connection
+@app.get("/health")
+async def health():
+    # Without the database or Redis nothing here works, so report unhealthy
     try:
-        await db.execute(text("SELECT 1"))
-    except Exception as exc:
-        return JSONResponse(
-            {"status": "degraded", "error": f"Database unreachable: {exc}"},
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-
-    # Check Redis connection
-    try:
-        await redis_client.ping()
-    except Exception as exc:
-        return JSONResponse(
-            {"status": "degraded", "error": f"Redis unreachable: {exc}"},
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-
-    return JSONResponse({"status": "ok"})
-
-
-# ── Routers ───────────────────────────────────────────────────────────────────
-
-from .approvals import router as approvals_router  # noqa: E402
-from .passkeys import router as passkeys_router  # noqa: E402
-from .signatures import router as signatures_router  # noqa: E402
-from .users import router as users_router  # noqa: E402
-from .vault import router as vault_router  # noqa: E402
-
-app.include_router(users_router)
-app.include_router(passkeys_router)
-app.include_router(approvals_router)
-app.include_router(signatures_router)
-app.include_router(vault_router)
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+        await redis.ping()
+    except Exception:
+        return JSONResponse({"status": "unavailable"}, status_code=503)
+    return {"status": "ok"}

@@ -1,111 +1,76 @@
+# Lint + tests on every push and pull request. Each job is one green/red tick on GitHub.
+# The whole-system Docker test (tests/e2e) is not run here: it takes minutes and builds
+# 3 images. Run it on your laptop before merging (see MANUAL_TODO.md, step A5).
 name: CI
 
 on:
   push:
-    branches: ["**"]
   pull_request:
-    branches: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:  # a newer push to the same branch cancels the older run
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # ── Shared contracts package ────────────────────────────────────────────────
   contracts:
-    name: contracts package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install contracts
-        run: pip install -e packages/contracts pytest
-      - name: Test contracts
-        run: pytest packages/contracts/tests -q
+      - run: pip install ./packages/contracts pytest ruff
+      # The contracts are frozen exactly as the handbook wrote them, so only real errors are
+      # checked there (syntax, undefined/unused names), not style. Their tests follow our style.
+      - run: ruff check --isolated --select E9,F --exclude packages/contracts/tests packages/contracts
+      - run: ruff check --isolated --select E,F,I,B,UP --line-length 100 tests/contracts
+      - run: pytest -q tests/contracts
 
-  # ── Per-service matrix ──────────────────────────────────────────────────────
-  services:
-    name: ${{ matrix.service }}
+  service:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      fail-fast: false  # one red service doesn't hide the others' results
       matrix:
         service: [messaging, money, identity]
-
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
     services:
       postgres:
         image: postgres:16
         env:
           POSTGRES_USER: app
-          POSTGRES_PASSWORD: app
+          POSTGRES_PASSWORD: app  # throwaway CI database, not a secret
           POSTGRES_DB: postgres
         ports: ["5432:5432"]
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+          --health-cmd "pg_isready -U app" --health-interval 2s --health-timeout 5s
+          --health-retries 30
       redis:
         image: redis:7
         ports: ["6379:6379"]
         options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 5s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install contracts
-        run: pip install -e packages/contracts
-
-      - name: Install service dependencies
-        working-directory: services/${{ matrix.service }}
-        run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-
-      - name: Lint (ruff)
-        working-directory: services/${{ matrix.service }}
-        run: |
-          if command -v ruff &> /dev/null; then
-            ruff check .
-          else
-            echo "ruff not installed, skipping"
-          fi
-
-      - name: Test (pytest)
-        working-directory: services/${{ matrix.service }}
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements.txt
+      - name: Create the test databases
         env:
-          DATABASE_URL: postgresql+asyncpg://app:app@localhost:5432/postgres
-          REDIS_URL: redis://localhost:6379/0
-          INTERNAL_API_KEY: ci-test-key
-          PHONE_HASH_KEY: ${{ '0' * 64 }}
-          PUBLIC_BASE_URL: http://localhost:8003
-          RP_ID: localhost
-          RP_NAME: "CI Test"
-          FERNET_KEY: ""
-          VAULT_MASTER_KEY: ""
-          SESSION_SECRET: ci-session-secret
-          STORAGE_BACKEND: local
-          ENV: dev
-          MONEY_URL: http://localhost:8002
-          IDENTITY_URL: http://localhost:8003
-          WA_VERIFY_TOKEN: ci-token
-          WA_APP_SECRET: ci-secret
-          WA_ACCESS_TOKEN: ci-access
-          WA_PHONE_NUMBER_ID: "000"
-          WA_FAKE_SEND: "true"
-          LLM_MODEL: claude-opus-4-5
-          ANTHROPIC_API_KEY: ci-key
+          PGPASSWORD: app
         run: |
-          if [ -d tests ] && [ "$(ls tests/ 2>/dev/null)" ]; then
-            pytest -q || true
-          else
-            echo "No tests yet for ${{ matrix.service }}, skipping"
-          fi
+          psql -h localhost -U app -d postgres -c "CREATE DATABASE money_test;"
+          psql -h localhost -U app -d postgres -c "CREATE DATABASE identity_test;"
+      - run: pip install -r requirements.txt
+      - run: ruff check .
+      - run: pytest -q
+      - name: policy.py must stay at 100% coverage
+        if: matrix.service == 'money'
+        run: pytest -q tests/test_policy.py --cov=app.policy --cov-report=term-missing --cov-fail-under=100

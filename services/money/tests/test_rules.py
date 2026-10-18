@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from contracts.models import TransferProposal
 from fakeredis import FakeAsyncRedis
 from sqlalchemy import insert, select, update
 
@@ -22,8 +23,10 @@ from app.models import (
     Transfer,
     TransferState,
 )
+from app.proposals import spent_this_month_bdt
 from app.providers.mock import MockProvider
 from app.rules_engine import freeze_user, index_rule, on_rate
+from app.transfers import create_transfer
 from tests.test_executor import LostRequestProvider, approved_transfer
 
 D = Decimal
@@ -312,3 +315,23 @@ async def _age(session, transfer_id, minutes):
         .where(Transfer.id == transfer_id)
         .values(updated_at=datetime.now(UTC) - timedelta(minutes=minutes))
     )
+
+
+async def test_rule_run_that_never_got_a_quote_does_not_count_this_month(session, redis):
+    # e.g. the rate went stale mid-run: the transfer stays CREATED and can never move money
+    mandate = await active_rule(session, redis)
+    await set_rate(redis, "136")
+
+    async def mandate_transfer():
+        proposal = TransferProposal(
+            user_id=mandate.user_id,
+            from_currency="BDT",
+            to_currency="IDR",
+            amount=D("500"),
+            idempotency_key=f"mandate-test-{uuid.uuid4()}",
+        )
+        return await create_transfer(session, proposal, mandate_id=mandate.id)
+
+    await mandate_transfer()  # the dead run
+    current = await mandate_transfer()
+    assert await spent_this_month_bdt(session, redis, current) == 0

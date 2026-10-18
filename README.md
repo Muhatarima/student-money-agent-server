@@ -114,7 +114,7 @@ The system deploys as 7 services from the single repository:
 - `identity-api` (public domain for passkey linking, approvals, and vault)
 - `identity-jobs` (`python -m app.jobs`)
 
-See [`services/identity/README.md`](services/identity/README.md) and [`docs/engineer-C-identity-web-vault.md`](docs/engineer-C-identity-web-vault.md) for full Railway provisioning steps and environment configuration.
+See [`DEPLOY.md`](DEPLOY.md) for the exact Railway + Cloudflare R2 steps and [`MANUAL_TODO.md`](MANUAL_TODO.md) for the human-only checklist.
 
 ## Guides
 

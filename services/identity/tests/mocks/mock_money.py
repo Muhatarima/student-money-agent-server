@@ -1,21 +1,21 @@
+"""Fake Money service (Engineer B): accepts /internal/approvals/confirmed.
+Run from services/identity:  uvicorn tests.mocks.mock_money:app --port 8002
+"""
+
 from contracts.models import ApprovalConfirmed
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException
 
-app = FastAPI(title="Mock Money Service")
-
-# Storage to inspect confirmed calls during tests
-confirmed_approvals: list[dict] = []
+app = FastAPI(title="Mock Money")
+confirmed: list[ApprovalConfirmed] = []  # what Identity told us
+answer = {"status": 200}  # tests can make it refuse
 
 
 @app.post("/internal/approvals/confirmed")
-async def confirm_approval(
-    payload: ApprovalConfirmed,
-    x_internal_key: str | None = Header(None, alias="X-Internal-Key"),
-):
-    if not x_internal_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-Internal-Key"
-        )
-
-    confirmed_approvals.append(payload.model_dump())
-    return {"status": "ok", "approval_id": str(payload.approval_id)}
+async def approvals_confirmed(body: ApprovalConfirmed, x_internal_key: str = Header("")):
+    if x_internal_key != "test-key":  # tests only; the real money service uses compare_digest
+        raise HTTPException(401, "bad key")
+    if answer["status"] != 200:
+        raise HTTPException(answer["status"], "refused")
+    confirmed.append(body)
+    print(f"confirmed approval {body.approval_id}")  # no personal data in here
+    return {"ok": True}

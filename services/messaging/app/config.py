@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     # WhatsApp Cloud API (sending). With WA_FAKE_SEND=true nothing is sent to Meta.
     wa_fake_send: bool = False
+    wa_fake_send_url: str = ""  # optional, in fake mode: also POST there (mock_server.py)
     wa_access_token: SecretStr = SecretStr("")
     wa_phone_number_id: str = ""
     wa_api_version: str = "v21.0"

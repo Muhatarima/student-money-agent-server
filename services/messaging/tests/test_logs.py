@@ -43,3 +43,16 @@ def test_filter_masks_args_and_tracebacks():
     text = logging.Formatter().format(record)
     assert "8801700001234" not in text
     assert "from ****1234" in text and "bad phone ****1234" in text
+
+
+def test_real_uvicorn_access_log_line_is_masked_and_does_not_crash():
+    # uvicorn's access formatter reads record.args, so the filter must keep the tuple
+    from uvicorn.logging import AccessFormatter
+
+    args = ("127.0.0.1:5000", "GET", "/webhook?hub.verify_token=abc123", "1.1", 200)
+    record = logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d', args, None
+    )
+    assert MASK.filter(record)
+    line = AccessFormatter(use_colors=False).format(record)
+    assert "abc123" not in line and "hub.verify_token=****" in line

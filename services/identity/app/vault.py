@@ -1,277 +1,223 @@
-import hashlib
+"""Document vault: passkey-gated upload, envelope encryption, auto-delete.
+
+Envelope encryption: every document gets its OWN key (data key). The file is encrypted
+with it, and the data key itself is encrypted ("wrapped") with VAULT_MASTER_KEY.
+Deleting the wrapped key makes any leftover copy of the file unreadable.
+Nothing in the MVP ever returns a document's contents.
+"""
+
+import asyncio
 import hmac
-import time
+import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import filetype
 from cryptography.fernet import Fernet
-from fastapi import (
-    APIRouter,
-    Cookie,
-    Depends,
-    File,
-    Form,
-    HTTPException,
-    Request,
-    UploadFile,
-    status,
-)
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .audit import audit
-from .auth import require_internal_key
-from .config import settings
-from .crypto import ensure_utc, hash_token, new_token
-from .db import get_db
-from .models import Document, LinkToken, User
-from .storage import get_storage
+from app.audit import audit
+from app.auth import require_internal_key
+from app.config import settings
+from app.crypto import hash_token, new_token
+from app.db import get_session
+from app.models import Document, UploadLink, User
+from app.passkeys import AuthFailed, CredentialIn, TokenIn, finish_auth, start_auth
+from app.redis_client import redis
+from app.storage import storage
+from app.web import limit_verify, message_page, require_browser_json, templates
 
-router = APIRouter(tags=["vault"])
-templates = Jinja2Templates(directory="templates")
+router = APIRouter()
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-ALLOWED_EXTENSIONS = {"pdf", "jpg", "jpeg", "png"}
+LINK_TTL = timedelta(minutes=15)
+SESSION_SECONDS = 600  # 10 minutes after the fingerprint check
+CHALLENGE_TTL = 300
+MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+KEEP_FOR = timedelta(days=7)
+DOC_TYPES = {"passport", "visa", "admission_letter", "other"}
+# Checked by the file's first bytes (magic bytes), never by its name
+ALLOWED_TYPES = {"application/pdf", "image/jpeg", "image/png"}
+COOKIE = "upload_session"
 
-
-def sign_vault_session(user_id: uuid.UUID) -> str:
-    """Create a tamper-evident session token valid for 10 minutes."""
-    expiry = int(time.time()) + 600
-    msg = f"{user_id}:{expiry}".encode()
-    sig = hmac.new(settings.SESSION_SECRET.encode(), msg, hashlib.sha256).hexdigest()
-    return f"{user_id}:{expiry}:{sig}"
-
-
-def verify_vault_session(cookie_val: str | None) -> uuid.UUID | None:
-    """Verify session cookie validity, signature, and expiration."""
-    if not cookie_val:
-        return None
-    parts = cookie_val.split(":")
-    if len(parts) != 3:
-        return None
-    user_str, expiry_str, sig = parts
-    try:
-        expiry = int(expiry_str)
-        if time.time() > expiry:
-            return None
-        msg = f"{user_str}:{expiry}".encode()
-        expected_sig = hmac.new(settings.SESSION_SECRET.encode(), msg, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected_sig):
-            return None
-        return uuid.UUID(user_str)
-    except Exception:
-        return None
+_sessions = URLSafeTimedSerializer(settings.session_secret.get_secret_value(), salt="upload")
 
 
-def generate_csrf_token(session_cookie: str) -> str:
-    """Generate CSRF token bound to the current vault session."""
-    return hmac.new(
-        settings.SESSION_SECRET.encode(), session_cookie.encode(), hashlib.sha256
-    ).hexdigest()
-
-
-class UploadLinkRequest(BaseModel):
+class UploadLinkIn(BaseModel):
     user_id: uuid.UUID
 
 
-@router.post(
-    "/internal/upload-links",
-    dependencies=[Depends(require_internal_key)],
-)
-async def create_upload_link(
-    payload: UploadLinkRequest,
-    db: AsyncSession = Depends(get_db),
+# --- Created by Messaging ---
+
+
+@router.post("/internal/upload-links", dependencies=[Depends(require_internal_key)])
+async def create_upload_link(body: UploadLinkIn, session: AsyncSession = Depends(get_session)):
+    user = await session.get(User, body.user_id)
+    if user is None or not user.linked or user.frozen:
+        raise HTTPException(409, "user can't upload right now")
+    token = new_token()
+    link = UploadLink(
+        user_id=user.id, token_hash=hash_token(token), expires_at=datetime.now(UTC) + LINK_TTL
+    )
+    session.add(link)
+    await session.flush()
+    await audit(session, "messaging", "upload_link.created", str(user.id), {})
+    await session.commit()
+    return {"url": f"{settings.public_base_url}/upload/{link.id}?t={token}"}
+
+
+# --- Helpers ---
+
+
+async def _valid_link(session: AsyncSession, link_id: uuid.UUID, token: str, for_update=False):
+    """The upload link if the token matches, it's unused, unexpired and the user isn't frozen."""
+    query = select(UploadLink).where(
+        UploadLink.id == link_id, UploadLink.token_hash == hash_token(token)
+    )
+    if for_update:
+        query = query.with_for_update()
+    link = await session.scalar(query)
+    if link is None or link.used_at is not None or link.expires_at <= datetime.now(UTC):
+        return None
+    user = await session.get(User, link.user_id)
+    return None if user.frozen else link
+
+
+async def _link_or_410(session, link_id, token, for_update=False) -> UploadLink:
+    link = await _valid_link(session, link_id, token, for_update)
+    if link is None:
+        raise HTTPException(410, "This link expired or was already used.")
+    return link
+
+
+def _read_session(request: Request, link_id: uuid.UUID) -> dict | None:
+    """The signed upload session from the cookie, if it is for this link and still fresh."""
+    try:
+        data = _sessions.loads(request.cookies.get(COOKIE, ""), max_age=SESSION_SECONDS)
+    except BadSignature:  # also covers "expired"
+        return None
+    return data if data.get("link_id") == str(link_id) else None
+
+
+def _challenge_key(link_id: uuid.UUID) -> str:
+    return f"webauthn:upload:{link_id}"
+
+
+# --- Page, passkey login, upload ---
+
+
+@router.get("/upload/{link_id}")
+async def upload_page(
+    request: Request, link_id: uuid.UUID, t: str = "", session=Depends(get_session)
 ):
-    """Generate a single-use upload link valid for 15 minutes."""
-    stmt = select(User).where(User.id == payload.user_id)
-    res = await db.execute(stmt)
-    user = res.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found.")
-
-    raw_token = new_token()
-    token_h = hash_token(raw_token)
-    upload_id = uuid.uuid4()
-    now = datetime.now(UTC)
-    expires_at = now + timedelta(minutes=15)
-
-    link_token = LinkToken(
-        id=upload_id,
-        token_hash=token_h,
-        phone_hash=user.phone_hash,
-        wa_id_encrypted=user.wa_id_encrypted,
-        expires_at=expires_at,
-    )
-    db.add(link_token)
-    await audit(
-        db,
-        actor="internal",
-        action="upload_link.created",
-        target=user.id,
-        details={"upload_id": str(upload_id)},
-    )
-    await db.commit()
-
-    return {"url": f"{settings.PUBLIC_BASE_URL}/upload/{upload_id}?t={raw_token}"}
+    if await _valid_link(session, link_id, t) is None:
+        return message_page(request, "Link expired", "Ask again in WhatsApp (send UPLOAD).", 410)
+    upload_session = _read_session(request, link_id)
+    context = {
+        "title": "Upload a document",
+        "link_id": link_id,
+        "token": t,
+        "logged_in": upload_session is not None,
+        "csrf": upload_session["csrf"] if upload_session else "",
+        "doc_types": sorted(DOC_TYPES),
+    }
+    return templates.TemplateResponse(request, "upload.html", context)
 
 
-@router.get("/upload/{upload_id}", response_class=HTMLResponse)
-async def get_upload_page(
-    request: Request,
-    upload_id: uuid.UUID,
-    t: str = "",
-    vault_session: str | None = Cookie(None),
-    db: AsyncSession = Depends(get_db),
+@router.post("/upload/{link_id}/options", dependencies=[Depends(require_browser_json)])
+async def upload_options(link_id: uuid.UUID, body: TokenIn, session=Depends(get_session)):
+    link = await _link_or_410(session, link_id, body.t)
+    challenge = secrets.token_bytes(32)
+    await redis.set(_challenge_key(link_id), challenge.hex(), ex=CHALLENGE_TTL)
+    return await start_auth(session, link.user_id, challenge)
+
+
+@router.post("/upload/{link_id}/verify", dependencies=[Depends(require_browser_json)])
+async def upload_verify(
+    request: Request, link_id: uuid.UUID, body: CredentialIn, session=Depends(get_session)
 ):
-    """Serve upload form for authenticated passkey sessions or authenticate valid tokens."""
-    # Check if user already has an active, valid session cookie
-    valid_user_id = verify_vault_session(vault_session)
-    if valid_user_id is not None:
-        csrf = generate_csrf_token(vault_session)  # type: ignore[arg-type]
-        return templates.TemplateResponse(
-            request=request,
-            name="upload.html",
-            context={"upload_id": upload_id, "csrf_token": csrf},
-        )
+    await limit_verify(request, str(link_id))
+    link = await _link_or_410(session, link_id, body.t)
+    challenge = await redis.getdel(_challenge_key(link_id))  # works once only
+    if challenge is None:
+        raise HTTPException(400, "Please start again.")
+    try:
+        await finish_auth(session, link.user_id, body.credential, bytes.fromhex(challenge))
+    except AuthFailed:
+        raise HTTPException(400, "Fingerprint check failed. Please try again.") from None
+    await session.commit()
 
-    # If no session, authenticate using token link
-    if not t:
-        return HTMLResponse(
-            "<p>Authentication required. Please request a new upload link.</p>", status_code=401
-        )
-
-    token_h = hash_token(t)
-    stmt = select(LinkToken).where(LinkToken.id == upload_id, LinkToken.token_hash == token_h)
-    res = await db.execute(stmt)
-    link_token = res.scalar_one_or_none()
-
-    now = datetime.now(UTC)
-    if (
-        link_token is None
-        or link_token.used_at is not None
-        or ensure_utc(link_token.expires_at) < now
-    ):
-        return HTMLResponse(
-            "<p>This upload link has expired or has already been used.</p>", status_code=410
-        )
-
-    # Find user
-    u_stmt = select(User).where(User.phone_hash == link_token.phone_hash)
-    u_res = await db.execute(u_stmt)
-    user = u_res.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found.")
-
-    # BUG-4 fix: mark token as used so the upload link cannot be replayed
-    # within its 15-minute window by anyone who intercepts the URL.
-    link_token.used_at = now
-    await db.commit()
-
-    session_val = sign_vault_session(user.id)
-    csrf = generate_csrf_token(session_val)
-
-    # Set 10-minute HttpOnly signed session cookie
-    response = templates.TemplateResponse(
-        request=request,
-        name="upload.html",
-        context={"upload_id": upload_id, "csrf_token": csrf},
+    cookie = _sessions.dumps(
+        {"link_id": str(link_id), "user_id": str(link.user_id), "csrf": secrets.token_urlsafe(32)}
     )
-    is_secure = settings.ENV == "production"
+    response = JSONResponse({"ok": True, "redirect": f"/upload/{link_id}?t={body.t}"})
     response.set_cookie(
-        key="vault_session",
-        value=session_val,
-        max_age=600,
+        COOKIE,
+        cookie,
+        max_age=SESSION_SECONDS,
+        path="/upload",
         httponly=True,
-        secure=is_secure,
+        secure=settings.public_base_url.startswith("https://"),  # not on plain localhost
         samesite="strict",
     )
     return response
 
 
-@router.post("/upload/{upload_id}")
-async def upload_document(
-    upload_id: uuid.UUID,
+@router.post("/upload/{link_id}")
+async def upload(
+    request: Request,
+    link_id: uuid.UUID,
+    t: str = Form(...),
+    csrf: str = Form(...),
     doc_type: str = Form(...),
-    csrf_token: str = Form(...),
     file: UploadFile = File(...),
-    vault_session: str | None = Cookie(None),
-    db: AsyncSession = Depends(get_db),
+    session: AsyncSession = Depends(get_session),
 ):
-    """Upload and envelope-encrypt a sensitive document, auto-purging after 7 days."""
-    user_id = verify_vault_session(vault_session)
-    if user_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Valid vault session required."
+    if request.headers.get("origin") != settings.public_base_url:
+        raise HTTPException(403, "bad origin")
+    upload_session = _read_session(request, link_id)
+    if upload_session is None:
+        raise HTTPException(401, "Please confirm with your fingerprint first.")
+    if not hmac.compare_digest(csrf, upload_session["csrf"]):
+        raise HTTPException(403, "bad CSRF token")
+    link = await _link_or_410(session, link_id, t, for_update=True)
+    if doc_type not in DOC_TYPES:
+        raise HTTPException(422, "unknown document type")
+
+    data = await file.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise HTTPException(413, "The file is bigger than 10 MB.")
+    kind = filetype.guess(data)
+    if kind is None or kind.mime not in ALLOWED_TYPES:
+        raise HTTPException(415, "Only PDF, JPEG or PNG files.")
+
+    data_key = Fernet.generate_key()  # this document's own key
+    ciphertext = Fernet(data_key).encrypt(data)
+    wrapped_key = Fernet(settings.vault_master_key.get_secret_value()).encrypt(data_key)
+    storage_key = uuid.uuid4().hex  # never the file name
+    await asyncio.to_thread(storage.put, storage_key, ciphertext)
+
+    delete_after = datetime.now(UTC) + KEEP_FOR
+    session.add(
+        Document(
+            user_id=link.user_id,
+            doc_type=doc_type,
+            storage_key=storage_key,
+            wrapped_key=wrapped_key,
+            content_type=kind.mime,
+            size_bytes=len(data),
+            delete_after=delete_after,
         )
-
-    expected_csrf = generate_csrf_token(vault_session)  # type: ignore[arg-type]
-    if not hmac.compare_digest(csrf_token, expected_csrf):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token.")
-
-    # 1. Read file contents and check size limit (10MB)
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail="File exceeds maximum allowed size of 10 MB.",
-        )
-
-    # 2. Check MAGIC BYTES using filetype library (reject renamed binaries)
-    kind = filetype.guess(content)
-    if kind is None or kind.extension.lower() not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported file type. Only PDF, JPEG, and PNG files are allowed.",
-        )
-
-    # 3. Envelope Encryption
-    # Generate random unique data key for this file
-    data_key = Fernet.generate_key()
-    ciphertext = Fernet(data_key).encrypt(content)
-
-    # Wrap the data key using the vault master key
-    master_fernet = Fernet(settings.VAULT_MASTER_KEY.encode())
-    wrapped_key = master_fernet.encrypt(data_key)
-
-    # Random storage key (UUID, never the user's filename)
-    storage_key = str(uuid.uuid4())
-    storage = get_storage()
-    await storage.put(storage_key, ciphertext)
-
-    now = datetime.now(UTC)
-    delete_after = now + timedelta(days=7)
-
-    doc_record = Document(
-        id=uuid.uuid4(),
-        user_id=user_id,
-        doc_type=doc_type,
-        storage_key=storage_key,
-        wrapped_key=wrapped_key,
-        content_type=kind.mime,
-        size_bytes=len(content),
-        delete_after=delete_after,
-        created_at=now,
     )
-    db.add(doc_record)
-    await audit(
-        db,
-        actor=str(user_id),
-        action="document.uploaded",
-        target=user_id,
-        details={"doc_type": doc_type, "size_bytes": len(content)},
-    )
-    await db.commit()
-
-    date_str = delete_after.strftime("%Y-%m-%d")
-    return HTMLResponse(
-        f"<!DOCTYPE html><html>"
-        f"<body style='font-family:sans-serif;text-align:center;padding:50px;'>"
-        f"<h2>Document Stored Securely ✅</h2>"
-        f"<p>Stored securely with envelope encryption. Auto-deletes on {date_str}.</p>"
-        f"<p>You can close this window and return to WhatsApp.</p>"
-        f"</body></html>"
+    link.used_at = datetime.now(UTC)  # single-use
+    await audit(session, "user", "document.uploaded", str(link.user_id), {"doc_type": doc_type})
+    await session.commit()
+    return message_page(
+        request,
+        "Stored securely 🔒",
+        f"Your document is encrypted. It auto-deletes on {delete_after:%d %B %Y}.",
     )

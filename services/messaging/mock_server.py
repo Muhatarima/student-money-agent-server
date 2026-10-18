@@ -4,7 +4,8 @@ Run from services/messaging:  uvicorn mock_server:app --port 8009
 POST /fake-whatsapp/send  takes the same JSON body as Meta's /messages endpoint
 GET  /fake-whatsapp/sent  shows what was "sent" (kept in memory, never printed or logged,
                           because messages can contain approval links)
-Our own code doesn't need this: with WA_FAKE_SEND=true, app/whatsapp.py never calls Meta.
+With WA_FAKE_SEND=true, app/whatsapp.py never calls Meta. Set WA_FAKE_SEND_URL to
+http://localhost:8009/fake-whatsapp/send to see the worker's and notifier's messages here.
 """
 
 from fastapi import FastAPI

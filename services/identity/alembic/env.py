@@ -1,24 +1,15 @@
 import asyncio
-import os
-import sys
 from logging.config import fileConfig
 
+from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy.ext.asyncio import create_async_engine
 
-from alembic import context
-
-# Add the service root to sys.path so alembic can import app modules.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-# Import all models so Alembic can detect them.
-import app.models  # noqa: F401, E402
-from app.config import settings  # noqa: E402
-from app.db import Base  # noqa: E402
+from app.config import settings
+from app.models import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -27,9 +18,8 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=settings.database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -45,21 +35,14 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-    async with connectable.connect() as connection:
+    # The URL comes from .env (via settings), never from alembic.ini
+    engine = create_async_engine(settings.database_url, poolclass=pool.NullPool)
+    async with engine.connect() as connection:
         await connection.run_sync(do_run_migrations)
-    await connectable.dispose()
-
-
-def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    await engine.dispose()
 
 
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    run_migrations_online()
+    asyncio.run(run_async_migrations())

@@ -1,10 +1,6 @@
-import redis.asyncio as aioredis
+from redis.asyncio import Redis
 
-from .config import settings
+from app.config import settings
 
-# Single shared async Redis client (protocol=2 required for Upstash compatibility).
-redis_client: aioredis.Redis = aioredis.from_url(
-    settings.REDIS_URL,
-    protocol=2,
-    decode_responses=True,
-)
+# One shared client. protocol=2 so it also works with Upstash (see handbook)
+redis = Redis.from_url(settings.redis_url, protocol=2, decode_responses=True)

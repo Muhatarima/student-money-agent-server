@@ -24,8 +24,11 @@ def mask_secrets(text: str) -> str:
 
 class MaskFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = mask_secrets(record.getMessage())
-        record.args = None  # already merged into msg
+        # Mask the message and each argument, but keep their shape: uvicorn's access-log
+        # formatter needs the original args tuple
+        record.msg = mask_secrets(str(record.msg))
+        if isinstance(record.args, tuple):
+            record.args = tuple(mask_secrets(a) if isinstance(a, str) else a for a in record.args)
         if record.exc_info:
             # Tracebacks can contain values too: mask the formatted text instead
             record.exc_text = mask_secrets(logging.Formatter().formatException(record.exc_info))

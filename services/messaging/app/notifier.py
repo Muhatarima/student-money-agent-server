@@ -88,7 +88,9 @@ async def deliver(to: str, event: NotifyEvent) -> bool:
         case "account_linked":
             await whatsapp.send_text(to, "🔐 Account secured with your passkey!")
         case "frozen":
-            await whatsapp.send_text(to, "🧊 Everything is frozen. No money can move.")
+            # Identity and Money each publish this, and the FREEZE handler has already
+            # confirmed to the user. Sending here too would mean 3 messages for one FREEZE.
+            pass
         case _:
             return False
     return True

@@ -1,115 +1,75 @@
+"""Tamper-evident audit log.
+
+Each row stores row_hash = sha256(prev_hash + canonical_json(its fields)), so changing or
+removing any old row breaks every hash after it. A DB trigger also blocks UPDATE/DELETE.
+Never put PII in details; the target (e.g. a user id) is stored only as a hash.
+"""
+
 import hashlib
 from datetime import UTC, datetime
-from typing import Any
 
 from contracts.hashing import canonical_json
-from sqlalchemy import select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import AuditEvent
+from app.models import AuditEvent
 
-GENESIS_HASH = "0" * 64
-
-# PostgreSQL advisory lock ID used to serialise all audit-chain writes.
-# This prevents two concurrent requests from reading the same prev_hash and
-# corrupting the hash chain. Must be stable across deployments.
-_AUDIT_LOCK_ID = 8_675_309  # arbitrary stable integer
+GENESIS = "0" * 64  # prev_hash of the very first row
+AUDIT_LOCK = 42_001  # any fixed number: one writer at a time keeps the chain straight
 
 
-def _prehash(value: Any) -> str:
-    """Return a stable SHA-256 hex digest of any value.
-
-    Callers that already have a 64-char hex digest should pass it directly;
-    this function always produces a deterministic, collision-resistant string
-    without fragile "is this already a hash?" heuristics.
-    """
-    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
-def format_ts(ts: datetime) -> str:
-    """Format datetime as UTC ISO string consistently across SQLite and Postgres."""
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
-    return ts.isoformat()
+def _row_hash(prev_hash: str, ts: datetime, actor: str, action: str, target_hash, details):
+    fields = {
+        "ts": ts.isoformat(),
+        "actor": actor,
+        "action": action,
+        "target_hash": target_hash,
+        "details": details,
+    }
+    return _sha256(prev_hash + canonical_json(fields))
 
 
 async def audit(
-    session: AsyncSession,
-    actor: str,
-    action: str,
-    target: Any,
-    details: dict[str, Any],
-) -> AuditEvent:
-    """Store an append-only, tamper-evident audit record hash-chained to the prior event.
-
-    Uses a PostgreSQL advisory transaction lock to serialise concurrent writes
-    so the hash chain is never corrupted by two simultaneous requests.
-    """
-    # Acquire advisory lock for the duration of this transaction.
-    # On SQLite (tests) this is a no-op — SQLite serialises writes natively.
-    try:
-        await session.execute(text(f"SELECT pg_advisory_xact_lock({_AUDIT_LOCK_ID})"))
-    except Exception:
-        # SQLite / non-Postgres environment: fall through (tests use SQLite)
-        pass
-
-    stmt = select(AuditEvent).order_by(AuditEvent.id.desc()).limit(1)
-    res = await session.execute(stmt)
-    latest = res.scalar_one_or_none()
-    prev_hash = latest.row_hash if latest is not None else GENESIS_HASH
-
-    ts = datetime.now(UTC)
-    target_h = _prehash(target)
-
-    fields = {
-        "ts": format_ts(ts),
-        "actor": actor,
-        "action": action,
-        "target_hash": target_h,
-        "details": details,
-    }
-    row_hash = hashlib.sha256((prev_hash + canonical_json(fields)).encode("utf-8")).hexdigest()
-
-    event = AuditEvent(
-        ts=ts,
-        actor=actor,
-        action=action,
-        target_hash=target_h,
-        details=details,
-        prev_hash=prev_hash,
-        row_hash=row_hash,
+    session: AsyncSession, actor: str, action: str, target: str | None, details: dict
+) -> None:
+    """Add one row. Runs in the caller's transaction: it's saved when they commit."""
+    # Without this lock, two requests at once could both chain onto the same row
+    await session.execute(select(func.pg_advisory_xact_lock(AUDIT_LOCK)))
+    prev_hash = await session.scalar(
+        select(AuditEvent.row_hash).order_by(AuditEvent.id.desc()).limit(1)
     )
-    session.add(event)
+    prev_hash = prev_hash or GENESIS
+    ts = datetime.now(UTC)
+    target_hash = _sha256(target) if target is not None else None
+    session.add(
+        AuditEvent(
+            ts=ts,
+            actor=actor,
+            action=action,
+            target_hash=target_hash,
+            details=details,
+            prev_hash=prev_hash,
+            row_hash=_row_hash(prev_hash, ts, actor, action, target_hash, details),
+        )
+    )
     await session.flush()
-    return event
 
 
 async def verify_chain(session: AsyncSession) -> bool:
-    """Recompute and verify all row hashes in the audit chain from genesis.
-
-    Uses yield_per() to stream rows in batches of 500 — avoids OOM on large logs.
-    """
-    stmt = select(AuditEvent).order_by(AuditEvent.id.asc()).execution_options(yield_per=500)
-    expected_prev = GENESIS_HASH
-
-    async for event in await session.stream_scalars(stmt):
-        if event.prev_hash != expected_prev:
+    """Recompute every hash from the first row. False = something was changed or removed."""
+    expected_prev = GENESIS
+    rows = await session.stream_scalars(select(AuditEvent).order_by(AuditEvent.id))
+    async for row in rows:
+        if row.prev_hash != expected_prev:
             return False
-
-        fields = {
-            "ts": format_ts(event.ts),
-            "actor": event.actor,
-            "action": event.action,
-            "target_hash": event.target_hash,
-            "details": event.details,
-        }
-        calculated_hash = hashlib.sha256(
-            (expected_prev + canonical_json(fields)).encode("utf-8")
-        ).hexdigest()
-
-        if event.row_hash != calculated_hash:
+        recomputed = _row_hash(
+            row.prev_hash, row.ts, row.actor, row.action, row.target_hash, row.details
+        )
+        if recomputed != row.row_hash:
             return False
-
-        expected_prev = event.row_hash
-
+        expected_prev = row.row_hash
     return True

@@ -1,359 +1,245 @@
+"""Approval pages: the user sees exactly what Money asks to approve and signs it with a passkey.
+
+Why it's safe:
+- The passkey challenge is sha256(payload_hash + nonce), so the fingerprint signature
+  covers exactly what was shown. payload_hash is recomputed from the shown summary
+  every time; if anything was changed, nothing can be approved (fail closed).
+- The link is single-use, expires, and only this user's passkeys can sign it.
+"""
+
 import hashlib
+import hmac
+import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
-import httpx
+from contracts.hashing import payload_hash
 from contracts.models import ApprovalConfirmed, ApprovalCreate, ApprovalCreated
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from webauthn import base64url_to_bytes
+from webauthn.helpers import base64url_to_bytes
 
-from .audit import audit
-from .auth import require_internal_key
-from .config import settings
-from .crypto import ensure_utc, hash_token, new_token
-from .db import get_db
-from .models import Approval, Signature, User
-from .passkeys import finish_auth, start_auth
-from .redis_client import redis_client
+from app import money_client
+from app.audit import audit
+from app.auth import require_internal_key
+from app.config import settings
+from app.crypto import hash_token, new_token
+from app.db import get_session
+from app.models import Approval, ApprovalState, Signature, User
+from app.passkeys import AuthFailed, CredentialIn, TokenIn, finish_auth, start_auth
+from app.web import limit_verify, message_page, require_browser_json, templates
 
-# Maximum WebAuthn verification attempts per approval before auto-rejection
-_MAX_VERIFY_ATTEMPTS = 3
+router = APIRouter()
 
-router = APIRouter(tags=["approvals"])
-templates = Jinja2Templates(directory="templates")
+MAX_TTL = timedelta(minutes=10)
+EXPIRED_TEXT = "This request expired. Ask again in WhatsApp."
 
-
-class TokenRequest(BaseModel):
-    t: str
-
-
-class VerifyApprovalRequest(BaseModel):
-    t: str
-    credential: dict[str, Any]
-
-
-def derive_approval_challenge(payload_hash: str, nonce: str) -> bytes:
-    """Derive 32-byte cryptographic challenge = sha256(payload_hash + nonce)."""
-    return hashlib.sha256((payload_hash + nonce).encode("utf-8")).digest()
-
-
-# ── Internal Endpoint for Engineer B ─────────────────────────────────────────
+# What the page shows, in this order, for each kind
+TRANSFER_ROWS = [
+    ("amount", "You send"),
+    ("amount_out", "You receive"),
+    ("rate", "Rate"),
+    ("fee", "Fee"),
+    ("provider", "Provider"),
+]
+RULE_ROWS = [
+    ("target_rate", "When the rate reaches"),
+    ("amount_per_run", "Convert each time"),
+    ("max_per_month", "Monthly maximum"),
+    ("valid_until", "Valid until"),
+]
 
 
-@router.post(
-    "/internal/approvals",
-    response_model=ApprovalCreated,
-    dependencies=[Depends(require_internal_key)],
-)
+def derive_challenge(payload_hash_: str, nonce: str) -> bytes:
+    """The passkey challenge: binds the fingerprint signature to exactly this payload."""
+    return hashlib.sha256((payload_hash_ + nonce).encode()).digest()
+
+
+def challenge_for(approval: Approval) -> bytes:
+    return derive_challenge(approval.payload_hash, approval.nonce)
+
+
+def summary_is_intact(approval: Approval) -> bool:
+    # What we show must hash to what Money asked for. If not, someone changed it.
+    return hmac.compare_digest(payload_hash(approval.summary), approval.payload_hash)
+
+
+# --- Created by Money ---
+
+
+@router.post("/internal/approvals", dependencies=[Depends(require_internal_key)])
 async def create_approval(
-    payload: ApprovalCreate,
-    db: AsyncSession = Depends(get_db),
+    body: ApprovalCreate, session: AsyncSession = Depends(get_session)
 ) -> ApprovalCreated:
-    # Refuse if user is frozen or not linked
-    stmt = select(User).where(User.id == payload.user_id)
-    res = await db.execute(stmt)
-    user = res.scalar_one_or_none()
-
+    user = await session.get(User, body.user_id)
     if user is None or not user.linked or user.frozen:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="User not linked or account is frozen.",
-        )
+        raise HTTPException(409, "user can't approve right now")
+    if body.expires_at.tzinfo is None:
+        raise HTTPException(422, "expires_at needs a timezone")
 
-    now = datetime.now(UTC)
-    # Ensure expires_at is timezone-aware
-    target_expiry = payload.expires_at
-    if target_expiry.tzinfo is None:
-        target_expiry = target_expiry.replace(tzinfo=UTC)
-
-    max_expiry = now + timedelta(minutes=10)
-    actual_expires_at = min(target_expiry, max_expiry)
-
-    raw_token = new_token()
-    token_h = hash_token(raw_token)
-    nonce = new_token()
-    approval_id = uuid.uuid4()
-
+    token = new_token()
     approval = Approval(
-        id=approval_id,
-        user_id=payload.user_id,
-        kind=payload.kind,
-        subject_id=payload.subject_id,
-        payload_hash=payload.payload_hash,
-        summary=payload.summary,
-        token_hash=token_h,
-        nonce=nonce,
-        expires_at=actual_expires_at,
-        state="pending",
+        user_id=user.id,
+        kind=body.kind,
+        subject_id=body.subject_id,
+        payload_hash=body.payload_hash,
+        summary=body.summary,
+        token_hash=hash_token(token),  # only the hash is stored
+        nonce=secrets.token_hex(16),
+        expires_at=min(body.expires_at, datetime.now(UTC) + MAX_TTL),
     )
-    db.add(approval)
-    await audit(
-        db,
-        actor="internal:money",
-        action="approval.created",
-        target=approval_id,
-        details={"kind": payload.kind, "subject_id": str(payload.subject_id)},
+    session.add(approval)
+    await session.flush()
+    await audit(session, "money", "approval.created", str(approval.id), {"kind": body.kind})
+    await session.commit()
+    url = f"{settings.public_base_url}/approve/{approval.id}?t={token}"
+    return ApprovalCreated(approval_id=approval.id, url=url)
+
+
+# --- The page and its buttons ---
+
+
+async def _find(
+    session: AsyncSession, approval_id: uuid.UUID, token: str, for_update: bool = False
+) -> Approval | None:
+    query = select(Approval).where(
+        Approval.id == approval_id, Approval.token_hash == hash_token(token)
     )
-    await db.commit()
-
-    return ApprovalCreated(
-        approval_id=approval_id,
-        url=f"{settings.PUBLIC_BASE_URL}/approve/{approval_id}?t={raw_token}",
-    )
+    if for_update:
+        query = query.with_for_update()  # two taps at once: only one can approve
+    return await session.scalar(query)
 
 
-# ── Public Endpoints for User ────────────────────────────────────────────────
-
-
-@router.get("/approve/{approval_id}", response_class=HTMLResponse)
-async def get_approve_page(
-    request: Request,
-    approval_id: uuid.UUID,
-    t: str = "",
-    db: AsyncSession = Depends(get_db),
-):
-    if not t:
-        return HTMLResponse("<p>Missing token.</p>", status_code=400)
-
-    token_h = hash_token(t)
-    stmt = select(Approval).where(Approval.id == approval_id, Approval.token_hash == token_h)
-    res = await db.execute(stmt)
-    approval = res.scalar_one_or_none()
-
-    now = datetime.now(UTC)
-    if approval is None or approval.state != "pending" or ensure_utc(approval.expires_at) < now:
-        return HTMLResponse(
-            "<!DOCTYPE html><html>"
-            "<body style='font-family:sans-serif;text-align:center;padding:50px;'>"
-            "<h2>Request Expired or Unavailable</h2>"
-            "<p>This request expired. Ask again in WhatsApp.</p>"
-            "</body></html>",
-            status_code=410,
-        )
-
-    # Check that user is not frozen
-    user_stmt = select(User).where(User.id == approval.user_id)
-    user_res = await db.execute(user_stmt)
-    user = user_res.scalar_one_or_none()
-    if user is None or user.frozen:
-        return HTMLResponse(
-            "<!DOCTYPE html><html>"
-            "<body style='font-family:sans-serif;text-align:center;padding:50px;'>"
-            "<h2>Account Frozen</h2>"
-            "<p>This account is frozen. Unfreeze via WhatsApp before approving transfers.</p>"
-            "</body></html>",
-            status_code=403,
-        )
-
-    return templates.TemplateResponse(
-        request=request,
-        name="approve.html",
-        context={
-            "approval_id": approval.id,
-            "token": t,
-            "kind": approval.kind,
-            "summary": approval.summary,
-            "expires_at_iso": approval.expires_at.isoformat(),
-        },
-    )
-
-
-@router.get("/approve/{approval_id}/approved", response_class=HTMLResponse)
-async def get_approved_page(request: Request, approval_id: uuid.UUID):
-    return templates.TemplateResponse(request=request, name="approved.html")
-
-
-@router.post("/approve/{approval_id}/options")
-async def get_approval_auth_options(
-    approval_id: uuid.UUID,
-    payload: TokenRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    token_h = hash_token(payload.t)
-    stmt = select(Approval).where(Approval.id == approval_id, Approval.token_hash == token_h)
-    res = await db.execute(stmt)
-    approval = res.scalar_one_or_none()
-
-    now = datetime.now(UTC)
-    if approval is None or approval.state != "pending" or ensure_utc(approval.expires_at) < now:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Approval expired, invalid, or already processed.",
-        )
-
-    challenge = derive_approval_challenge(approval.payload_hash, approval.nonce)
-    return await start_auth(approval.user_id, challenge, db)
-
-
-@router.post("/approve/{approval_id}/verify")
-async def verify_and_confirm_approval(
-    approval_id: uuid.UUID,
-    payload: VerifyApprovalRequest,
-    origin: str | None = Header(None, alias="Origin"),
-    db: AsyncSession = Depends(get_db),
-):
-    token_h = hash_token(payload.t)
-
-    # 1. Row lock on approval to prevent double-spending / concurrent approvals
-    stmt = (
-        select(Approval)
-        .where(Approval.id == approval_id, Approval.token_hash == token_h)
-        .with_for_update()
-    )
-    res = await db.execute(stmt)
-    approval = res.scalar_one_or_none()
-
-    now = datetime.now(UTC)
+async def _problem(session: AsyncSession, approval: Approval | None) -> tuple[int, str] | None:
+    """Why this approval can't be used right now, or None if it can."""
     if approval is None:
-        raise HTTPException(status_code=404, detail="Approval not found.")
-    if approval.state != "pending":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Approval already processed."
+        return 404, "This link is not valid."
+    if approval.state != ApprovalState.PENDING:
+        return 409, "This request was already used."
+    if approval.expires_at <= datetime.now(UTC):
+        approval.state = ApprovalState.EXPIRED
+        await session.commit()
+        return 410, EXPIRED_TEXT
+    user = await session.get(User, approval.user_id)
+    if user.frozen:
+        return 403, "Your account is frozen. Nothing can be approved."
+    if not summary_is_intact(approval):
+        return 409, "This request can't be approved. Ask again in WhatsApp."
+    return None
+
+
+async def _usable(session: AsyncSession, approval_id, token, for_update=False) -> Approval:
+    approval = await _find(session, approval_id, token, for_update)
+    problem = await _problem(session, approval)
+    if problem:
+        raise HTTPException(*problem)
+    return approval
+
+
+def _rows(approval: Approval) -> list[tuple[str, str]]:
+    s = approval.summary
+    pair = f"{s.get('from_currency')} → {s.get('to_currency')}"
+    rows = [("Conversion", pair)]
+    for key, label in RULE_ROWS if approval.kind == "rule" else TRANSFER_ROWS:
+        rows.append((label, str(s.get(key, "—"))))
+    if approval.kind != "rule":
+        rows.append(("Recipient", s.get("recipient", "Your own wallet")))
+    return rows
+
+
+@router.get("/approve/{approval_id}")
+async def approve_page(
+    request: Request, approval_id: uuid.UUID, t: str = "", session=Depends(get_session)
+):
+    approval = await _find(session, approval_id, t)
+    problem = await _problem(session, approval)
+    if problem:
+        status, text = problem
+        return message_page(request, "Can't approve", text, status)
+    context = {
+        "title": "Review and approve",
+        "approval": approval,
+        "rows": _rows(approval),
+        "token": t,
+        "expires_at": approval.expires_at.isoformat(),
+    }
+    return templates.TemplateResponse(request, "approve.html", context)
+
+
+@router.post("/approve/{approval_id}/options", dependencies=[Depends(require_browser_json)])
+async def approve_options(approval_id: uuid.UUID, body: TokenIn, session=Depends(get_session)):
+    approval = await _usable(session, approval_id, body.t)
+    return await start_auth(session, approval.user_id, challenge_for(approval))
+
+
+@router.post("/approve/{approval_id}/verify", dependencies=[Depends(require_browser_json)])
+async def approve_verify(
+    request: Request, approval_id: uuid.UUID, body: CredentialIn, session=Depends(get_session)
+):
+    await limit_verify(request, str(approval_id))
+    approval = await _usable(session, approval_id, body.t, for_update=True)
+    try:
+        passkey = await finish_auth(
+            session, approval.user_id, body.credential, challenge_for(approval)
         )
-    if ensure_utc(approval.expires_at) < now:
-        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Approval has expired.")
+        response = body.credential["response"]
+        signature = Signature(
+            user_id=approval.user_id,
+            approval_id=approval.id,
+            credential_id=passkey.credential_id,
+            payload_hash=approval.payload_hash,
+            nonce=approval.nonce,
+            authenticator_data=base64url_to_bytes(response["authenticatorData"]),
+            client_data_json=base64url_to_bytes(response["clientDataJSON"]),
+            signature=base64url_to_bytes(response["signature"]),
+        )
+    except (AuthFailed, KeyError, TypeError, ValueError):
+        raise HTTPException(400, "Fingerprint check failed. Please try again.") from None
 
-    # 2. Per-approval attempt rate limit (max 3 failed WebAuthn attempts — then reject)
-    attempt_key = f"approval:attempts:{approval_id}"
-    try:
-        attempts = int(await redis_client.get(attempt_key) or 0)
-        if attempts >= _MAX_VERIFY_ATTEMPTS:
-            approval.state = "rejected"
-            await audit(
-                db,
-                actor="system",
-                action="approval.rejected_max_attempts",
-                target=approval.id,
-                details={"attempts": attempts},
-            )
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many failed attempts. This approval has been rejected.",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # Redis failure: allow request to proceed (fail-open for availability)
+    # One transaction: approved + signature + audit
+    approval.state = ApprovalState.APPROVED
+    session.add(signature)
+    await session.flush()
+    await audit(session, "user", "approval.approved", str(approval.id), {"kind": approval.kind})
+    await session.commit()
 
-    # 3. Derive expected challenge and finish WebAuthn auth
-    challenge = derive_approval_challenge(approval.payload_hash, approval.nonce)
-    try:
-        await finish_auth(approval.user_id, payload.credential, challenge, db, origin)
-    except HTTPException:
-        # Increment attempt counter on WebAuthn failure
-        try:
-            async with redis_client.pipeline(transaction=True) as pipe:
-                await pipe.incr(attempt_key)
-                await pipe.expire(attempt_key, 900)  # TTL matches max approval window (15min)
-                await pipe.execute()
-        except Exception:
-            pass
-        raise
-
-    # 4. Store raw signature assertion and mark approved — DO NOT COMMIT YET
-    cred_id_bytes = base64url_to_bytes(payload.credential["id"])
-    auth_data = base64url_to_bytes(payload.credential["response"]["authenticatorData"])
-    client_data = base64url_to_bytes(payload.credential["response"]["clientDataJSON"])
-    sig_bytes = base64url_to_bytes(payload.credential["response"]["signature"])
-
-    sig_id = uuid.uuid4()
-    signature_record = Signature(
-        id=sig_id,
-        user_id=approval.user_id,
-        approval_id=approval.id,
-        credential_id=cred_id_bytes,
-        payload_hash=approval.payload_hash,
-        nonce=approval.nonce,
-        authenticator_data=auth_data,
-        client_data_json=client_data,
-        signature=sig_bytes,
-    )
-    db.add(signature_record)
-    approval.state = "approved"
-    await audit(
-        db,
-        actor=str(approval.user_id),
-        action="approval.approved",
-        target=approval.id,
-        details={"signature_id": str(sig_id)},
-    )
-    # NOTE: db.commit() is intentionally AFTER the Money callback succeeds.
-    # If the callback fails, we roll back so the approval stays "pending" and
-    # the student can retry without burning their passkey biometric.
-
-    # 5. Notify Engineer B (Money service) via internal callback
-    confirmed_payload = ApprovalConfirmed(
+    confirmed = ApprovalConfirmed(
         approval_id=approval.id,
         subject_id=approval.subject_id,
         payload_hash=approval.payload_hash,
-        signature_id=sig_id,
+        signature_id=signature.id,
     )
-    headers = {"X-Internal-Key": settings.INTERNAL_API_KEY}
-    url = f"{settings.MONEY_URL.rstrip('/')}/internal/approvals/confirmed"
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.post(
-                url, json=confirmed_payload.model_dump(mode="json"), headers=headers
-            )
-            if resp.status_code >= 400:
-                # Money rejected — rollback so student can retry
-                await db.rollback()
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="Payment service error. No money was moved. Please try again.",
-                )
-        except httpx.RequestError as exc:
-            # Network error — rollback so student can retry
-            await db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Payment service unreachable. No money was moved. Please try again.",
-            ) from exc
-
-    # 6. Only commit once Money has confirmed receipt
-    await db.commit()
-
-    # Clean up attempt counter on success
-    try:
-        await redis_client.delete(attempt_key)
-    except Exception:
-        pass
-
-    return {"status": "ok", "approval_id": str(approval.id)}
+    if not await money_client.confirm_approval(confirmed):
+        await audit(session, "system", "approval.money_refused", str(approval.id), {})
+        await session.commit()
+        return {"ok": False, "redirect": "/approve-failed"}
+    return {"ok": True, "redirect": "/approved"}
 
 
-@router.post("/approve/{approval_id}/cancel")
-async def cancel_approval(
-    approval_id: uuid.UUID,
-    payload: TokenRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    token_h = hash_token(payload.t)
-    stmt = select(Approval).where(Approval.id == approval_id, Approval.token_hash == token_h)
-    res = await db.execute(stmt)
-    approval = res.scalar_one_or_none()
+@router.post("/approve/{approval_id}/cancel", dependencies=[Depends(require_browser_json)])
+async def approve_cancel(approval_id: uuid.UUID, body: TokenIn, session=Depends(get_session)):
+    approval = await _find(session, approval_id, body.t, for_update=True)
+    if approval is None or approval.state != ApprovalState.PENDING:
+        raise HTTPException(409, "This request was already used.")
+    approval.state = ApprovalState.REJECTED
+    await audit(session, "user", "approval.rejected", str(approval.id), {"kind": approval.kind})
+    await session.commit()
+    return {"ok": True, "redirect": "/cancelled"}
 
-    if approval is None or approval.state != "pending":
-        raise HTTPException(
-            status_code=400, detail="Cannot cancel: not found or already processed."
-        )
 
-    approval.state = "rejected"
-    await audit(
-        db,
-        actor=str(approval.user_id),
-        action="approval.cancelled",
-        target=approval.id,
-        details={},
+@router.get("/approved")
+async def approved_page(request: Request):
+    return message_page(request, "Approved ✅", "You'll get a receipt in WhatsApp.")
+
+
+@router.get("/approve-failed")
+async def approve_failed_page(request: Request):
+    return message_page(
+        request, "Not completed", "Something went wrong, no money was moved. Ask again in WhatsApp."
     )
-    await db.commit()
 
-    return {"status": "cancelled", "approval_id": str(approval.id)}
+
+@router.get("/cancelled")
+async def cancelled_page(request: Request):
+    return message_page(request, "Cancelled", "Nothing was approved. You can close this page.")

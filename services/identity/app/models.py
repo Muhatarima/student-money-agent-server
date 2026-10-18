@@ -1,178 +1,173 @@
+import enum
 import uuid
-from datetime import UTC, datetime
-from typing import Any
+from datetime import datetime
 
 from sqlalchemy import (
     JSON,
     BigInteger,
-    Boolean,
     DateTime,
+    Enum,
     ForeignKey,
-    Integer,
+    Index,
     LargeBinary,
+    MetaData,
     String,
     Text,
+    func,
+    text,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from .db import Base
+Hash = String(64)  # sha256 hex
 
 
-class User(Base):
+class ApprovalState(enum.StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    EXPIRED = "expired"
+    REJECTED = "rejected"
+
+
+class Base(DeclarativeBase):
+    # Predictable constraint names, so Alembic migrations stay stable
+    metadata = MetaData(
+        naming_convention={
+            "ix": "ix_%(column_0_label)s",
+            "uq": "uq_%(table_name)s_%(column_0_name)s",
+            "ck": "ck_%(table_name)s_%(constraint_name)s",
+            "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+            "pk": "pk_%(table_name)s",
+        }
+    )
+    type_annotation_map = {datetime: DateTime(timezone=True)}
+
+
+class IdMixin:
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class User(IdMixin, Base):
     __tablename__ = "users"
 
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    phone_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
-    wa_id_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
-    linked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    frozen: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        nullable=False,
-    )
-
-    passkeys: Mapped[list["Passkey"]] = relationship(
-        "Passkey", back_populates="user", cascade="all, delete-orphan"
-    )
-    approvals: Mapped[list["Approval"]] = relationship(
-        "Approval", back_populates="user", cascade="all, delete-orphan"
-    )
-    signatures: Mapped[list["Signature"]] = relationship(
-        "Signature", back_populates="user", cascade="all, delete-orphan"
-    )
-    documents: Mapped[list["Document"]] = relationship(
-        "Document", back_populates="user", cascade="all, delete-orphan"
-    )
+    # Never the raw phone: an HMAC hash made by Messaging (A)
+    phone_hash: Mapped[str] = mapped_column(Hash, unique=True)
+    wa_id_encrypted: Mapped[str] = mapped_column(Text)  # Fernet, see crypto.py
+    linked: Mapped[bool] = mapped_column(default=False)
+    frozen: Mapped[bool] = mapped_column(default=False)
 
 
-class Passkey(Base):
+class Passkey(IdMixin, Base):
     __tablename__ = "passkeys"
 
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
-    )
-    credential_id: Mapped[bytes] = mapped_column(
-        LargeBinary, unique=True, index=True, nullable=False
-    )
-    public_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    sign_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    transports: Mapped[str | None] = mapped_column(Text, nullable=True)
-    device_label: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        nullable=False,
-    )
-    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-    user: Mapped["User"] = relationship("User", back_populates="passkeys")
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    user: Mapped[User] = relationship()
+    credential_id: Mapped[bytes] = mapped_column(LargeBinary, unique=True)
+    public_key: Mapped[bytes] = mapped_column(LargeBinary)
+    sign_count: Mapped[int] = mapped_column(default=0)
+    transports: Mapped[str | None] = mapped_column(Text)
+    device_label: Mapped[str | None] = mapped_column(Text)
+    last_used_at: Mapped[datetime | None]
 
 
-class LinkToken(Base):
+class LinkToken(IdMixin, Base):
     __tablename__ = "link_tokens"
 
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
-    phone_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
-    wa_id_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    token_hash: Mapped[str] = mapped_column(Hash, unique=True)  # only the hash is stored
+    phone_hash: Mapped[str] = mapped_column(Hash)
+    wa_id_encrypted: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(index=True)  # purge job
+    used_at: Mapped[datetime | None]
 
 
-class Approval(Base):
+class Approval(IdMixin, Base):
     __tablename__ = "approvals"
-
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
-    )
-    kind: Mapped[str] = mapped_column(String(32), nullable=False)
-    subject_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
-    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
-    nonce: Mapped[str] = mapped_column(String(64), nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    state: Mapped[str] = mapped_column(
-        String(16), default="pending", nullable=False
-    )  # pending, approved, expired, rejected
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        nullable=False,
+    __table_args__ = (
+        # Freeze: expire all pending approvals of one user
+        Index("ix_approvals_user_id_state", "user_id", "state"),
+        # Purge job: pending approvals past their expiry
+        Index(
+            "ix_approvals_pending_expires_at",
+            "expires_at",
+            postgresql_where=text("state = 'pending'"),
+        ),
     )
 
-    user: Mapped["User"] = relationship("User", back_populates="approvals")
-    signatures: Mapped[list["Signature"]] = relationship(
-        "Signature", back_populates="approval", cascade="all, delete-orphan"
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    kind: Mapped[str] = mapped_column(String(20))  # "transfer" | "rule"
+    subject_id: Mapped[uuid.UUID]  # transfer_id or mandate_id, owned by Money
+    payload_hash: Mapped[str] = mapped_column(Hash)
+    summary: Mapped[dict] = mapped_column(JSON)
+    token_hash: Mapped[str] = mapped_column(Hash, unique=True)
+    nonce: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime]
+    state: Mapped[ApprovalState] = mapped_column(
+        Enum(
+            ApprovalState,
+            native_enum=False,
+            create_constraint=True,
+            length=20,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        default=ApprovalState.PENDING,
     )
 
 
-class Signature(Base):
+class Signature(IdMixin, Base):
+    """A stored passkey assertion: proof the user approved exactly payload_hash."""
+
     __tablename__ = "signatures"
 
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
-    )
-    approval_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("approvals.id", ondelete="CASCADE"), index=True, nullable=False
-    )
-    credential_id: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    nonce: Mapped[str] = mapped_column(String(64), nullable=False)
-    authenticator_data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    client_data_json: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    signature: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        nullable=False,
-    )
-
-    user: Mapped["User"] = relationship("User", back_populates="signatures")
-    approval: Mapped["Approval"] = relationship("Approval", back_populates="signatures")
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    approval_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("approvals.id"))
+    credential_id: Mapped[bytes] = mapped_column(LargeBinary)
+    payload_hash: Mapped[str] = mapped_column(Hash)
+    nonce: Mapped[str] = mapped_column(String(64))
+    authenticator_data: Mapped[bytes] = mapped_column(LargeBinary)
+    client_data_json: Mapped[bytes] = mapped_column(LargeBinary)
+    signature: Mapped[bytes] = mapped_column(LargeBinary)
 
 
-class Document(Base):
+class UploadLink(IdMixin, Base):
+    __tablename__ = "upload_links"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    token_hash: Mapped[str] = mapped_column(Hash, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(index=True)  # purge job
+    used_at: Mapped[datetime | None]
+
+
+class Document(IdMixin, Base):
     __tablename__ = "documents"
-
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
-    )
-    doc_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    storage_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    wrapped_key: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
-    content_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
-    delete_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        nullable=False,
+    __table_args__ = (
+        # Purge job: only documents not deleted yet
+        Index(
+            "ix_documents_delete_after",
+            "delete_after",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
     )
 
-    user: Mapped["User"] = relationship("User", back_populates="documents")
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    doc_type: Mapped[str] = mapped_column(String(30))
+    storage_key: Mapped[str] = mapped_column(String(64))  # random, never the file name
+    wrapped_key: Mapped[bytes | None] = mapped_column(LargeBinary)  # NULL = destroyed
+    content_type: Mapped[str] = mapped_column(String(50))
+    size_bytes: Mapped[int]
+    delete_after: Mapped[datetime]
+    deleted_at: Mapped[datetime | None]
 
 
 class AuditEvent(Base):
+    """Append-only (DB trigger, migration 0002) and hash-chained (see audit.py)."""
+
     __tablename__ = "audit_events"
 
-    id: Mapped[int] = mapped_column(
-        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
-    )
-    ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        nullable=False,
-    )
-    actor: Mapped[str] = mapped_column(String(128), nullable=False)
-    action: Mapped[str] = mapped_column(String(128), nullable=False)
-    target_hash: Mapped[str] = mapped_column(String(128), nullable=False)
-    details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    prev_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    row_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime]
+    actor: Mapped[str] = mapped_column(String(50))
+    action: Mapped[str] = mapped_column(String(50))
+    target_hash: Mapped[str | None] = mapped_column(Hash)  # never the target itself
+    details: Mapped[dict] = mapped_column(JSON)  # no PII
+    prev_hash: Mapped[str] = mapped_column(Hash)
+    row_hash: Mapped[str] = mapped_column(Hash)

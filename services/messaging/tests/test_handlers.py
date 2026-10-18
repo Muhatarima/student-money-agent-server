@@ -162,6 +162,22 @@ async def test_freeze_calls_both_services(monkeypatch, llm):
     assert called == [user_id_of()]
 
 
+@pytest.mark.parametrize("message", [job("FREEZE"), button("freeze")])
+async def test_freeze_still_runs_for_a_frozen_user(monkeypatch, llm, message):
+    # If Money's freeze failed after Identity's worked, the user is "frozen" in Identity
+    # only. Sending FREEZE again must finish the job, not just say "you're frozen".
+    mock_identity.frozen.add(user_id_of())
+    called = []
+
+    async def fake_freeze(user_id):
+        called.append(user_id)
+
+    monkeypatch.setattr(agent, "freeze_everything", fake_freeze)
+    await handlers.handle_message(message)
+    assert called == [user_id_of()]
+    assert replies() == [handlers.FREEZE_DONE]
+
+
 async def test_freeze_button(llm):
     await handlers.handle_message(button("freeze"))
     assert llm["calls"] == []

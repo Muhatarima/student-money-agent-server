@@ -1,26 +1,14 @@
+from collections.abc import AsyncIterator
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase
 
-from .config import settings
+from app.config import settings
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-)
-
-AsyncSessionLocal = async_sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
+# pool_pre_ping drops dead connections before using them
+engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-async def get_db() -> AsyncSession:  # type: ignore[return]
-    """FastAPI dependency that yields an async DB session."""
-    async with AsyncSessionLocal() as session:
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:
         yield session

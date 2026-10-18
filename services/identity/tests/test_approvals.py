@@ -1,272 +1,300 @@
 import hashlib
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-from httpx import AsyncClient
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from webauthn.helpers import bytes_to_base64url
+from contracts.hashing import payload_hash
+from sqlalchemy import select, update
 
-from app.crypto import encrypt_str, hash_token
-from app.models import Approval, Passkey, Signature, User
+from app import approvals, money_client
+from app.audit import verify_chain
+from app.models import Approval, ApprovalState, AuditEvent, Passkey, Signature, User
+from tests.conftest import KEY, ORIGIN
+from tests.factories import make_user
+from tests.fake_webauthn import challenge_of, make_credential
+from tests.mocks import mock_money
 
-INTERNAL_KEY = "test-internal-key"
-HEADERS = {"X-Internal-Key": INTERNAL_KEY}
+SUMMARY = {
+    "from_currency": "BDT",
+    "to_currency": "IDR",
+    "amount": "1000.00",
+    "rate": "135.00000000",
+    "fee": "20.00",
+    "amount_out": "132300.00",
+    "expires_at": "2099-01-01T00:00:00+00:00",
+    "provider": "mock",
+}
 
 
-@pytest.mark.asyncio
-async def test_create_approval_refuses_frozen_or_unlinked(
-    client: AsyncClient, db_session: AsyncSession
-):
-    # 1. Unlinked user
-    unlinked_user_id = uuid.uuid4()
-    u1 = User(
-        id=unlinked_user_id,
-        phone_hash="hash1" * 12,
-        wa_id_encrypted=encrypt_str("8801700000001"),
-        linked=False,
+@pytest.fixture(autouse=True)
+def money(monkeypatch):
+    mock_money.confirmed.clear()
+    mock_money.answer["status"] = 200
+    monkeypatch.setattr(money_client, "transport", httpx.ASGITransport(app=mock_money.app))
+    return mock_money
+
+
+async def linked_user(session, credential_id=None):
+    user = await make_user(session)
+    credential_id = credential_id or uuid.uuid4().bytes
+    session.add(
+        Passkey(user_id=user.id, credential_id=credential_id, public_key=b"pk-" + credential_id)
     )
-    # 2. Frozen user
-    frozen_user_id = uuid.uuid4()
-    u2 = User(
-        id=frozen_user_id,
-        phone_hash="hash2" * 12,
-        wa_id_encrypted=encrypt_str("8801700000002"),
-        linked=True,
-        frozen=True,
-    )
-    db_session.add_all([u1, u2])
-    await db_session.commit()
+    await session.flush()
+    return user, credential_id
 
-    base_payload = {
-        "kind": "transfer",
+
+def create_body(user, summary=SUMMARY, kind="transfer", minutes=1):
+    return {
+        "user_id": str(user.id),
+        "kind": kind,
         "subject_id": str(uuid.uuid4()),
-        "payload_hash": "a" * 64,
-        "summary": {"amount": "5000", "currency": "BDT"},
-        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        "payload_hash": payload_hash(summary),
+        "summary": summary,
+        "expires_at": (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat(),
     }
 
-    # Unlinked -> 409
-    res1 = await client.post(
-        "/internal/approvals",
-        json={**base_payload, "user_id": str(unlinked_user_id)},
-        headers=HEADERS,
+
+async def create(client, user, **kwargs):
+    response = await client.post(
+        "/internal/approvals", json=create_body(user, **kwargs), headers=KEY
     )
-    assert res1.status_code == 409
+    assert response.status_code == 200, response.text
+    url = response.json()["url"]
+    approval_id = url.split("/approve/")[1].split("?")[0]
+    return approval_id, url.split("t=")[1]
 
-    # Frozen -> 409
-    res2 = await client.post(
-        "/internal/approvals",
-        json={**base_payload, "user_id": str(frozen_user_id)},
-        headers=HEADERS,
+
+async def sign(client, approval_id, token, credential_id):
+    """What the browser does: get options, touch the sensor, send the answer."""
+    response = await client.post(
+        f"/approve/{approval_id}/options", json={"t": token}, headers=ORIGIN
     )
-    assert res2.status_code == 409
+    assert response.status_code == 200, response.text
+    credential = make_credential(challenge_of(response.json()), credential_id)
+    body = {"t": token, "credential": credential}
+    return await client.post(f"/approve/{approval_id}/verify", json=body, headers=ORIGIN)
 
 
-@pytest.mark.asyncio
-async def test_create_approval_happy_path(client: AsyncClient, db_session: AsyncSession):
-    user_id = uuid.uuid4()
-    user = User(
-        id=user_id,
-        phone_hash="hash_valid" * 10,
-        wa_id_encrypted=encrypt_str("8801700000003"),
-        linked=True,
-        frozen=False,
-    )
-    db_session.add(user)
-    await db_session.commit()
+# --- Creating ---
 
-    payload = {
-        "user_id": str(user_id),
-        "kind": "transfer",
-        "subject_id": str(uuid.uuid4()),
-        "payload_hash": "p" * 64,
-        "summary": {"amount": "1000", "currency": "BDT"},
-        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+
+async def test_create_needs_the_internal_key(client, session):
+    user, _ = await linked_user(session)
+    response = await client.post("/internal/approvals", json=create_body(user))
+    assert response.status_code == 401
+
+
+async def test_create_stores_only_token_hash_and_caps_expiry(client, session):
+    user, _ = await linked_user(session)
+    approval_id, token = await create(client, user, minutes=60)
+    approval = await session.get(Approval, uuid.UUID(approval_id))
+    assert token not in approval.token_hash
+    assert approval.expires_at <= datetime.now(UTC) + timedelta(minutes=10)  # capped at 10 min
+    assert approval.nonce and approval.state == ApprovalState.PENDING
+
+
+@pytest.mark.parametrize("change", [{"frozen": True}, {"linked": False}])
+async def test_create_refused_for_frozen_or_unlinked_user(client, session, change):
+    user = await make_user(session, **change)
+    response = await client.post("/internal/approvals", json=create_body(user), headers=KEY)
+    assert response.status_code == 409
+
+
+async def test_create_unknown_user_is_409(client):
+    body = create_body(User(id=uuid.uuid4()))
+    assert (await client.post("/internal/approvals", json=body, headers=KEY)).status_code == 409
+
+
+# --- The page ---
+
+
+async def test_page_shows_exactly_the_summary(client, session):
+    user, _ = await linked_user(session)
+    approval_id, token = await create(client, user)
+    response = await client.get(f"/approve/{approval_id}?t={token}")
+    assert response.status_code == 200
+    for value in ["1000.00", "132300.00", "135.00000000", "20.00", "mock", "BDT → IDR"]:
+        assert value in response.text
+    assert "Approve with fingerprint" in response.text and "data-expires-at" in response.text
+
+
+async def test_rule_page_shows_rule_fields_and_warning(client, session):
+    user, _ = await linked_user(session)
+    rule = {
+        "from_currency": "BDT",
+        "to_currency": "IDR",
+        "target_rate": "136",
+        "amount_per_run": "500",
+        "max_per_month": "5000",
+        "valid_until": "2099-01-01T00:00:00+00:00",
     }
-
-    res = await client.post("/internal/approvals", json=payload, headers=HEADERS)
-    assert res.status_code == 200
-    data = res.json()
-    assert "approval_id" in data
-    assert "/approve/" in data["url"]
+    approval_id, token = await create(client, user, summary=rule, kind="rule")
+    text = (await client.get(f"/approve/{approval_id}?t={token}")).text
+    assert "136" in text and "5000" in text
+    assert "run automatically within these limits until you freeze it" in text
 
 
-@pytest.mark.asyncio
-async def test_get_approve_page(client: AsyncClient, db_session: AsyncSession):
-    user_id = uuid.uuid4()
-    user = User(
-        id=user_id,
-        phone_hash="hash_page" * 10,
-        wa_id_encrypted="enc",
-        linked=True,
-        frozen=False,
+async def test_wrong_token_page_is_404(client, session):
+    user, _ = await linked_user(session)
+    approval_id, _ = await create(client, user)
+    assert (await client.get(f"/approve/{approval_id}?t=wrong")).status_code == 404
+
+
+async def test_expired_page(client, session):
+    user, _ = await linked_user(session)
+    approval_id, token = await create(client, user)
+    await session.execute(update(Approval).values(expires_at=datetime.now(UTC)))
+    response = await client.get(f"/approve/{approval_id}?t={token}")
+    assert response.status_code == 410 and "expired" in response.text
+
+
+# --- Approving ---
+
+
+async def test_happy_path_signs_and_tells_money(client, session):
+    user, cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    response = await sign(client, approval_id, token, cid)
+    assert response.json() == {"ok": True, "redirect": "/approved"}
+
+    approval = await session.get(Approval, uuid.UUID(approval_id))
+    assert approval.state == ApprovalState.APPROVED
+    signature = await session.scalar(select(Signature).where(Signature.approval_id == approval.id))
+    assert signature.payload_hash == approval.payload_hash and signature.nonce == approval.nonce
+    assert signature.credential_id == cid
+
+    [confirmed] = mock_money.confirmed
+    assert confirmed.approval_id == approval.id and confirmed.subject_id == approval.subject_id
+    assert confirmed.payload_hash == approval.payload_hash
+    assert confirmed.signature_id == signature.id
+    actions = (await session.scalars(select(AuditEvent.action))).all()
+    assert "approval.created" in actions and "approval.approved" in actions
+    assert await verify_chain(session)
+
+
+async def test_challenge_is_bound_to_payload_hash_and_nonce(client, session):
+    user, _ = await linked_user(session)
+    approval_id, token = await create(client, user)
+    options = await client.post(
+        f"/approve/{approval_id}/options", json={"t": token}, headers=ORIGIN
     )
-    approval_id = uuid.uuid4()
-    raw_token = "approval-token-xyz"
-    approval = Approval(
-        id=approval_id,
-        user_id=user_id,
-        kind="transfer",
-        subject_id=uuid.uuid4(),
-        payload_hash="p" * 64,
-        summary={"amount": "2500 BDT", "fee": "10 BDT"},
-        token_hash=hash_token(raw_token),
-        nonce="nonce123",
-        expires_at=datetime.now(UTC) + timedelta(minutes=8),
-        state="pending",
+    approval = await session.get(Approval, uuid.UUID(approval_id))
+    assert challenge_of(options.json()) == approvals.challenge_for(approval)
+    assert (
+        approvals.challenge_for(approval)
+        == hashlib.sha256((approval.payload_hash + approval.nonce).encode()).digest()
     )
-    db_session.add_all([user, approval])
-    await db_session.commit()
-
-    # Valid pending approval
-    res = await client.get(f"/approve/{approval_id}?t={raw_token}")
-    assert res.status_code == 200
-    assert "Confirm Transfer" in res.text
-    assert "2500 BDT" in res.text
-
-    # Expired token
-    approval.expires_at = datetime.now(UTC) - timedelta(minutes=1)
-    await db_session.commit()
-    res_exp = await client.get(f"/approve/{approval_id}?t={raw_token}")
-    assert res_exp.status_code == 410
 
 
-@pytest.mark.asyncio
-async def test_approval_verification_and_money_callback(
-    client: AsyncClient, db_session: AsyncSession
-):
-    user_id = uuid.uuid4()
-    cred_id = b"approval-cred-bytes-1"
-    pub_key = b"approval-pub-key-1"
-
-    user = User(
-        id=user_id,
-        phone_hash="hash_verify" * 10,
-        wa_id_encrypted="enc",
-        linked=True,
+async def test_tampered_summary_in_db_cannot_be_approved(client, session):
+    user, cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    tampered = SUMMARY | {"amount_out": "999999.00"}
+    await session.execute(update(Approval).values(summary=tampered))
+    response = await client.post(
+        f"/approve/{approval_id}/options", json={"t": token}, headers=ORIGIN
     )
-    passkey = Passkey(
-        id=uuid.uuid4(),
-        user_id=user_id,
-        credential_id=cred_id,
-        public_key=pub_key,
-        sign_count=10,
+    assert response.status_code == 409
+    assert (await client.get(f"/approve/{approval_id}?t={token}")).status_code == 409
+    assert mock_money.confirmed == []
+
+
+async def test_signature_for_another_challenge_is_refused(client, session):
+    user, cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    credential = make_credential(b"a different payload", cid)
+    body = {"t": token, "credential": credential}
+    response = await client.post(f"/approve/{approval_id}/verify", json=body, headers=ORIGIN)
+    assert response.status_code == 400
+    assert mock_money.confirmed == []
+
+
+async def test_token_reuse_is_409(client, session):
+    user, cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    assert (await sign(client, approval_id, token, cid)).status_code == 200
+    options = await client.post(
+        f"/approve/{approval_id}/options", json={"t": token}, headers=ORIGIN
     )
-    approval_id = uuid.uuid4()
-    raw_token = "app-tok-verify"
-    payload_hash = "h" * 64
-    nonce = "n" * 32
+    assert options.status_code == 409
+    assert len(mock_money.confirmed) == 1
 
-    approval = Approval(
-        id=approval_id,
-        user_id=user_id,
-        kind="transfer",
-        subject_id=uuid.uuid4(),
-        payload_hash=payload_hash,
-        summary={"amount": "500 USD"},
-        token_hash=hash_token(raw_token),
-        nonce=nonce,
-        expires_at=datetime.now(UTC) + timedelta(minutes=10),
-        state="pending",
+
+async def test_expired_never_calls_money(client, session):
+    user, cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    await session.execute(update(Approval).values(expires_at=datetime.now(UTC)))
+    credential = make_credential(b"x", cid)
+    body = {"t": token, "credential": credential}
+    response = await client.post(f"/approve/{approval_id}/verify", json=body, headers=ORIGIN)
+    assert response.status_code == 410
+    assert mock_money.confirmed == []
+
+
+async def test_frozen_user_is_refused(client, session):
+    user, cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    await session.execute(update(User).where(User.id == user.id).values(frozen=True))
+    response = await client.post(
+        f"/approve/{approval_id}/options", json={"t": token}, headers=ORIGIN
     )
-    db_session.add_all([user, passkey, approval])
-    await db_session.commit()
+    assert response.status_code == 403
+    assert mock_money.confirmed == []
 
-    # 1. POST /options -> gets challenge
-    res_opt = await client.post(f"/approve/{approval_id}/options", json={"t": raw_token})
-    assert res_opt.status_code == 200
-    expected_challenge = hashlib.sha256((payload_hash + nonce).encode("utf-8")).digest()
-    assert res_opt.json()["challenge"] == bytes_to_base64url(expected_challenge)
 
-    # 2. Mock webauthn authentication verification & Engineer B money callback
-    mock_auth_outcome = MagicMock()
-    mock_auth_outcome.new_sign_count = 11
+async def test_another_users_passkey_is_refused(client, session):
+    user, _ = await linked_user(session)
+    _, other_cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    response = await sign(client, approval_id, token, other_cid)
+    assert response.status_code == 400
+    assert mock_money.confirmed == []
 
-    fake_credential = {
-        "id": bytes_to_base64url(cred_id),
-        "response": {
-            "authenticatorData": bytes_to_base64url(b"auth_data"),
-            "clientDataJSON": bytes_to_base64url(b"client_data"),
-            "signature": bytes_to_base64url(b"sig_bytes"),
-        },
-    }
 
-    mock_money_resp = MagicMock()
-    mock_money_resp.status_code = 200
+async def test_money_refusing_shows_failed_and_is_audited(client, session):
+    mock_money.answer["status"] = 409
+    user, cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    response = await sign(client, approval_id, token, cid)
+    assert response.json() == {"ok": False, "redirect": "/approve-failed"}
+    actions = (await session.scalars(select(AuditEvent.action))).all()
+    assert "approval.money_refused" in actions
+    assert "no money was moved" in (await client.get("/approve-failed")).text
 
-    from unittest.mock import AsyncMock
 
-    mock_instance = MagicMock()
-    mock_instance.__aenter__.return_value = mock_instance
-    mock_instance.__aexit__.return_value = None
-    mock_instance.post = AsyncMock(return_value=mock_money_resp)
+async def test_money_unreachable_counts_as_refused(client, session, monkeypatch):
+    def down(request):
+        raise httpx.ConnectError("down")
 
-    with (
-        patch("app.approvals.finish_auth", return_value=passkey),
-        patch("app.approvals.httpx.AsyncClient", return_value=mock_instance),
-    ):
-        res_verify = await client.post(
-            f"/approve/{approval_id}/verify",
-            json={"t": raw_token, "credential": fake_credential},
-        )
-        assert res_verify.status_code == 200
-        assert res_verify.json()["status"] == "ok"
+    monkeypatch.setattr(money_client, "transport", httpx.MockTransport(down))
+    user, cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    assert (await sign(client, approval_id, token, cid)).json()["ok"] is False
 
-        # Ensure call to Engineer B occurred
-        mock_instance.post.assert_called_once()
-        call_url = mock_instance.post.call_args[0][0]
-        assert "/internal/approvals/confirmed" in call_url
 
-    # Check DB state: approval is approved, signature created
-    await db_session.refresh(approval)
-    assert approval.state == "approved"
+# --- Cancel ---
 
-    stmt = select(Signature).where(Signature.approval_id == approval_id)
-    sig_res = await db_session.execute(stmt)
-    sig = sig_res.scalar_one()
-    assert sig.user_id == user_id
-    assert sig.payload_hash == payload_hash
 
-    # Token reuse test: second verify must fail with 409 Conflict
-    res_reuse = await client.post(
-        f"/approve/{approval_id}/verify",
-        json={"t": raw_token, "credential": fake_credential},
+async def test_cancel(client, session):
+    user, cid = await linked_user(session)
+    approval_id, token = await create(client, user)
+    response = await client.post(
+        f"/approve/{approval_id}/cancel", json={"t": token}, headers=ORIGIN
     )
-    assert res_reuse.status_code == 409
-
-
-@pytest.mark.asyncio
-async def test_cancel_approval(client: AsyncClient, db_session: AsyncSession):
-    user_id = uuid.uuid4()
-    user = User(
-        id=user_id,
-        phone_hash="hash_cancel" * 10,
-        wa_id_encrypted="enc",
-        linked=True,
+    assert response.json()["redirect"] == "/cancelled"
+    approval = await session.get(Approval, uuid.UUID(approval_id))
+    assert approval.state == ApprovalState.REJECTED
+    # Cancelled can't be approved any more
+    options = await client.post(
+        f"/approve/{approval_id}/options", json={"t": token}, headers=ORIGIN
     )
-    approval_id = uuid.uuid4()
-    raw_token = "tok-cancel"
-    approval = Approval(
-        id=approval_id,
-        user_id=user_id,
-        kind="rule",
-        subject_id=uuid.uuid4(),
-        payload_hash="p" * 64,
-        summary={"target_rate": "130.5"},
-        token_hash=hash_token(raw_token),
-        nonce="nonce-c",
-        expires_at=datetime.now(UTC) + timedelta(minutes=5),
-        state="pending",
-    )
-    db_session.add_all([user, approval])
-    await db_session.commit()
+    assert options.status_code == 409
 
-    res = await client.post(f"/approve/{approval_id}/cancel", json={"t": raw_token})
-    assert res.status_code == 200
-    assert res.json()["status"] == "cancelled"
 
-    await db_session.refresh(approval)
-    assert approval.state == "rejected"
+async def test_cancel_with_wrong_token_is_409(client, session):
+    user, _ = await linked_user(session)
+    approval_id, _ = await create(client, user)
+    response = await client.post(f"/approve/{approval_id}/cancel", json={"t": "x"}, headers=ORIGIN)
+    assert response.status_code == 409

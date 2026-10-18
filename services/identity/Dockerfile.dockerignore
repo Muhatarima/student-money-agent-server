@@ -1,0 +1,14 @@
+# Only used for services/identity/Dockerfile (doesn't affect the other services)
+**/.env
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/*.egg-info
+**/vault_local
+.git
+docs
+services/messaging
+services/money
+services/identity/tests

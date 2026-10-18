@@ -1,11 +1,18 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Student Money Agent</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} · Student Money Agent</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="{{ simplewebauthn_url }}" integrity="{{ simplewebauthn_sri }}" crossorigin="anonymous" defer></script>
+  <script src="/static/passkey.js" defer></script>
 </head>
 <body>
-    <p>Page coming soon.</p>
+  <main>
+    <h1>{{ title }}</h1>
+    {% block content %}{% endblock %}
+    <p id="error" class="error" hidden></p>
+  </main>
 </body>
 </html>

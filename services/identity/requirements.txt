@@ -14,10 +14,10 @@ webauthn
 cryptography
 boto3
 filetype
+itsdangerous
 pytest
 pytest-asyncio
-httpx
-aiosqlite
+pytest-cov
 fakeredis
 ruff
 -e ../../packages/contracts

@@ -88,6 +88,19 @@ async def test_send_link_button_fake(fake_mode, caplog):
     assert "approve/abc" not in caplog.text  # links can carry tokens
 
 
+async def test_fake_send_url_forwards_to_the_mock_server(fake_mode, monkeypatch):
+    # The worker and notifier are separate processes: WA_FAKE_SEND_URL lets a demo or the
+    # e2e test see their messages in mock_server.py. Meta is never called.
+    import mock_server
+
+    mock_server.sent.clear()
+    monkeypatch.setattr(settings, "wa_fake_send_url", "http://fake-wa/fake-whatsapp/send")
+    monkeypatch.setattr(whatsapp, "transport", httpx.ASGITransport(app=mock_server.app))
+    await whatsapp.send_text(TO, "Hi")
+    assert mock_server.sent == fake_mode
+    assert mock_server.sent[0]["text"] == {"body": "Hi"}
+
+
 # --- Real mode (fake Meta) ---
 
 

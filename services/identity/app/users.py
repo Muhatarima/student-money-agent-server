@@ -1,147 +1,97 @@
+"""Internal user endpoints, called by Messaging (A). All need X-Internal-Key."""
+
 import uuid
 from datetime import UTC, datetime, timedelta
 
 from contracts.models import LinkTokenOut, UserOut
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .audit import audit
-from .auth import require_internal_key
-from .config import settings
-from .crypto import decrypt_str, encrypt_str, hash_token, new_token
-from .db import get_db
-from .events import publish_event
-from .models import Approval, LinkToken, User
-from .redis_client import redis_client
+from app import events
+from app.audit import audit
+from app.auth import require_internal_key
+from app.config import settings
+from app.crypto import decrypt_str, encrypt_str, hash_token, new_token
+from app.db import get_session
+from app.models import Approval, ApprovalState, LinkToken, User
+from app.redis_client import redis
 
-router = APIRouter(
-    prefix="/internal", tags=["internal-users"], dependencies=[Depends(require_internal_key)]
-)
+router = APIRouter(prefix="/internal", dependencies=[Depends(require_internal_key)])
 
+LINK_TOKEN_TTL = timedelta(minutes=10)
+LINK_TOKENS_PER_HOUR = 5
 
-class LinkTokenRequest(BaseModel):
-    phone_hash: str = Field(min_length=16, max_length=64)
-    wa_id: str = Field(min_length=5, max_length=32)
+PhoneHash = Field(pattern=r"^[0-9a-f]{64}$")  # an HMAC-SHA256 hex, never a raw phone
 
 
-@router.get("/users/by-phone/{phone_hash}", response_model=UserOut)
-async def get_user_by_phone(
-    phone_hash: str,
-    db: AsyncSession = Depends(get_db),
-) -> UserOut:
-    stmt = select(User).where(User.phone_hash == phone_hash)
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
+class LinkTokenIn(BaseModel):
+    phone_hash: str = PhoneHash
+    wa_id: str = Field(pattern=r"^\d{6,20}$")  # WhatsApp id = digits only
+
+
+async def _get_user(session: AsyncSession, user_id: uuid.UUID) -> User:
+    user = await session.get(User, user_id)
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    return UserOut(
-        user_id=user.id,
-        linked=user.linked,
-        frozen=user.frozen,
-    )
+        raise HTTPException(404, "user not found")
+    return user
 
 
-@router.post("/link-tokens", response_model=LinkTokenOut)
+@router.get("/users/by-phone/{phone_hash}")
+async def user_by_phone(phone_hash: str, session: AsyncSession = Depends(get_session)) -> UserOut:
+    row = (
+        await session.execute(
+            select(User.id, User.linked, User.frozen).where(User.phone_hash == phone_hash)
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(404, "user not found")
+    return UserOut(user_id=row.id, linked=row.linked, frozen=row.frozen)
+
+
+@router.post("/link-tokens")
 async def create_link_token(
-    payload: LinkTokenRequest,
-    db: AsyncSession = Depends(get_db),
+    body: LinkTokenIn, session: AsyncSession = Depends(get_session)
 ) -> LinkTokenOut:
-    # Rate limit: max 5 requests per hour per phone_hash (atomic pipeline \u2014 BUG-6 fix)
-    rate_key = f"rate:link-token:{payload.phone_hash}"
-    try:
-        async with redis_client.pipeline(transaction=True) as pipe:
-            await pipe.incr(rate_key)
-            await pipe.expire(rate_key, 3600)
-            results = await pipe.execute()
-        count = results[0]
-        if count > 5:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit exceeded: max 5 link tokens per hour",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        # If Redis is unavailable in dev/test, proceed gracefully.
-        pass
+    # At most 5 links an hour per phone: stops someone spamming a student with links
+    key = f"identity:rl:link:{body.phone_hash}:{int(datetime.now(UTC).timestamp() // 3600)}"
+    count = await redis.incr(key)
+    await redis.expire(key, 3600)
+    if count > LINK_TOKENS_PER_HOUR:
+        raise HTTPException(429, "too many link requests, try again later")
 
-    raw_token = new_token()
-    token_h = hash_token(raw_token)
-    expires_at = datetime.now(UTC) + timedelta(minutes=10)
-    wa_encrypted = encrypt_str(payload.wa_id)
-
-    link_token = LinkToken(
-        token_hash=token_h,
-        phone_hash=payload.phone_hash,
-        wa_id_encrypted=wa_encrypted,
-        expires_at=expires_at,
+    token = new_token()
+    expires_at = datetime.now(UTC) + LINK_TOKEN_TTL
+    session.add(
+        LinkToken(
+            token_hash=hash_token(token),  # only the hash is stored
+            phone_hash=body.phone_hash,
+            wa_id_encrypted=encrypt_str(body.wa_id),
+            expires_at=expires_at,
+        )
     )
-    db.add(link_token)
-    await audit(
-        db,
-        actor="internal:messaging",
-        action="link_token.created",
-        target=payload.phone_hash,
-        details={"expires_in_seconds": 600},
-    )
-    await db.commit()
-
-    return LinkTokenOut(
-        url=f"{settings.PUBLIC_BASE_URL}/link?t={raw_token}",
-        expires_at=expires_at,
-    )
+    await session.commit()
+    return LinkTokenOut(url=f"{settings.public_base_url}/link?t={token}", expires_at=expires_at)
 
 
 @router.get("/users/{user_id}/wa-target")
-async def get_wa_target(
-    user_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, str]:
-    stmt = select(User).where(User.id == user_id)
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    wa_id = decrypt_str(user.wa_id_encrypted)
-    return {"wa_id": wa_id}
+async def wa_target(user_id: uuid.UUID, session: AsyncSession = Depends(get_session)) -> dict:
+    user = await _get_user(session, user_id)
+    return {"wa_id": decrypt_str(user.wa_id_encrypted)}
 
 
 @router.post("/users/{user_id}/freeze")
-async def freeze_user(
-    user_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, str]:
-    stmt = select(User).where(User.id == user_id)
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
+async def freeze(user_id: uuid.UUID, session: AsyncSession = Depends(get_session)) -> dict:
+    """Blocks new approvals and expires every pending one. Money freezes money separately."""
+    user = await _get_user(session, user_id)
     user.frozen = True
-
-    # Expire all pending approvals for this user
-    await db.execute(
+    await session.execute(
         update(Approval)
-        .where(Approval.user_id == user_id, Approval.state == "pending")
-        .values(state="expired")
+        .where(Approval.user_id == user_id, Approval.state == ApprovalState.PENDING)
+        .values(state=ApprovalState.EXPIRED)
     )
-
-    await audit(
-        db,
-        actor="internal",
-        action="user.frozen",
-        target=user_id,
-        details={},
-    )
-    await db.commit()
-
-    try:
-        await publish_event("frozen", user_id=user_id, data={})
-    except Exception:
-        pass
-
-    return {"status": "frozen", "user_id": str(user_id)}
+    await audit(session, "messaging", "user.frozen", str(user_id), {})
+    await session.commit()
+    await events.publish("frozen", user_id)
+    return {"frozen": True}

@@ -1,22 +1,21 @@
+"""Notifications for Messaging (A). Never put phone numbers, wa_id or document data in here."""
+
+import logging
 import uuid
-from typing import Any
 
 from contracts.events import NotifyEvent
 
-from .redis_client import redis_client
+from app.redis_client import redis
 
-EVENT_CHANNEL = "events:notify"
+log = logging.getLogger(__name__)
+
+STREAM = "events:notify"
 
 
-async def publish_event(
-    event_type: str, user_id: uuid.UUID, data: dict[str, Any] | None = None
-) -> None:
-    """Publish a notification event to the shared Redis events:notify channel."""
-    if data is None:
-        data = {}
-    event = NotifyEvent(
-        type=event_type,
-        user_id=user_id,
-        data=data,
-    )
-    await redis_client.publish(EVENT_CHANNEL, event.model_dump_json())
+async def publish(type: str, user_id: uuid.UUID, data: dict | None = None) -> None:
+    # Called after the DB change is committed: a lost notification must not undo it
+    try:
+        event = NotifyEvent(type=type, user_id=user_id, data=data or {})
+        await redis.xadd(STREAM, {"data": event.model_dump_json()})
+    except Exception:
+        log.exception("could not publish %s event", type)

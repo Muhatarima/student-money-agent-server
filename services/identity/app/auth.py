@@ -1,23 +1,13 @@
 import hmac
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException
 
-from .config import settings
+from app.config import settings
 
 
-async def require_internal_key(
-    x_internal_key: str | None = Header(None, alias="X-Internal-Key"),
-) -> None:
-    """FastAPI dependency. Raises 401 if the X-Internal-Key header is missing or wrong."""
-    if not x_internal_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing internal API key",
-        )
-    provided = x_internal_key.encode()
-    expected = settings.INTERNAL_API_KEY.encode()
-    if not hmac.compare_digest(provided, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing internal API key",
-        )
+def require_internal_key(x_internal_key: str = Header(default="")) -> None:
+    # An empty configured key must block everyone, not let an empty header in (fail closed).
+    # compare_digest = constant-time compare (stops timing attacks)
+    expected = settings.internal_api_key.get_secret_value().encode()
+    if not expected or not hmac.compare_digest(x_internal_key.encode(), expected):
+        raise HTTPException(status_code=401, detail="Invalid internal key")

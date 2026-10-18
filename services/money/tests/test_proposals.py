@@ -1,3 +1,5 @@
+import asyncio
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -5,11 +7,12 @@ from decimal import Decimal
 
 import httpx
 import pytest
-from contracts.models import ApprovalCreated
+from contracts.models import ApprovalCreated, TransferProposal
 from fakeredis import FakeAsyncRedis
-from sqlalchemy import update
+from sqlalchemy import pool, update
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
-from app import identity_client, main
+from app import identity_client, main, proposals
 from app.config import settings
 from app.db import get_session
 from app.models import Freeze, Quote, Recipient, Transfer, TransferState
@@ -167,6 +170,27 @@ async def test_over_daily_limit_is_rejected(client):
         assert (await propose(client, user_id, amount="50000"))["status"] == "pending_approval"
     result = await propose(client, user_id, amount="100")
     assert result["reason"] == "over_daily_limit"
+
+
+async def test_proposal_rejected_before_quote_does_not_count_today(client, redis):
+    # It stayed CREATED and can never move money, so it must not use up the daily limit
+    user_id = uuid.uuid4()
+    rate = await redis.hgetall("rates:BDT_IDR")
+    await redis.delete("rates:BDT_IDR")
+    assert (await propose(client, user_id, amount="50000"))["reason"] == "rate_unavailable"
+    await redis.hset("rates:BDT_IDR", mapping=rate)
+    for _ in range(2):
+        assert (await propose(client, user_id, amount="50000"))["status"] == "pending_approval"
+
+
+async def test_approval_with_expired_quote_does_not_count_today(client, session):
+    # Nobody can approve it any more, so it must not use up the daily limit
+    user_id = uuid.uuid4()
+    for _ in range(2):
+        assert (await propose(client, user_id, amount="50000"))["status"] == "pending_approval"
+    past = datetime.now(UTC) - timedelta(seconds=1)
+    await session.execute(update(Quote).values(expires_at=past))
+    assert (await propose(client, user_id, amount="50000"))["status"] == "pending_approval"
 
 
 async def test_frozen_user_is_rejected(client, session):
@@ -348,6 +372,8 @@ async def test_rule_reused_key_with_different_target_is_rejected(client):
     [
         ({"from_currency": "IDR", "to_currency": "BDT"}, "pair_not_supported"),
         ({"valid_until": "2020-01-01T00:00:00Z"}, "valid_until_in_past"),
+        # No timezone: we can't know when it ends, so refuse (was a 500 crash)
+        ({"valid_until": "2099-01-01T00:00:00"}, "valid_until_needs_timezone"),
     ],
 )
 async def test_bad_rule_is_rejected(client, changes, reason):
@@ -386,3 +412,21 @@ async def test_freeze_money_route(client, session):
     response = await client.post(f"/internal/users/{user_id}/freeze-money")
     assert response.json() == {"frozen": True}
     assert await session.get(Freeze, user_id) is not None
+
+
+async def test_concurrent_proposals_cannot_beat_the_daily_limit(migrated_db, redis, identity):
+    # Real race: separate DB connections. 3 x 40000 at once; the daily limit (100000) fits 2.
+    engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=pool.NullPool)
+    user_id = uuid.uuid4()
+
+    async def propose_once():
+        async with AsyncSession(engine, expire_on_commit=False) as session:  # like SessionLocal
+            body = transfer_body(user_id, amount="40000")
+            proposal = TransferProposal.model_validate(body)
+            return (await proposals.propose_transfer(session, redis, proposal)).status
+
+    try:
+        results = await asyncio.gather(*[propose_once() for _ in range(3)])
+    finally:
+        await engine.dispose()
+    assert sorted(results) == ["pending_approval", "pending_approval", "rejected"]

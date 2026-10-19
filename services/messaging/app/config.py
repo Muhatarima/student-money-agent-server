@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -23,9 +25,13 @@ class Settings(BaseSettings):
     wa_phone_number_id: str = ""
     wa_api_version: str = "v21.0"
 
-    # AI agent. No key = the agent is off and users get the button menu instead.
+    # AI agent. No key for the chosen provider = the agent is off and users get the button menu.
+    llm_provider: Literal["anthropic", "gemini"] = "gemini"
     anthropic_api_key: SecretStr = SecretStr("")
-    llm_model: str = "claude-opus-5-5"
+    llm_model: str = "claude-opus-5-5"  # the Claude model (LLM_PROVIDER=anthropic)
+    gemini_api_key: SecretStr = SecretStr("")
+    gemini_model: str = "gemini-3.8-flash"
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
 
 
 settings = Settings()

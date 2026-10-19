@@ -30,7 +30,8 @@ Every setting is listed in `.env.example`. The important switches:
 - `WA_FAKE_SEND=true`: nothing is sent to Meta (messages are only logged, masked).
   `WA_FAKE_SEND_URL=http://localhost:8009/fake-whatsapp/send` also shows them in
   `mock_server.py` (`uvicorn mock_server:app --port 8009`, then open `/fake-whatsapp/sent`).
-- `ANTHROPIC_API_KEY` empty: the AI is off and users get a 3-button menu. FREEZE still works.
+- `LLM_PROVIDER=gemini` (default, needs `GEMINI_API_KEY`) or `anthropic` (needs `ANTHROPIC_API_KEY`).
+  The chosen provider's key empty: the AI is off and users get a 3-button menu. FREEZE still works.
 
 ## Tests
 ```powershell

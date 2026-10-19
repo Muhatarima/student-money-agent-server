@@ -14,3 +14,11 @@ def test_missing_setting_error_hides_secret_values(monkeypatch):
     text = str(error.value)  # what a crash traceback prints
     assert "wa_verify_token" in text  # still names the missing field
     assert "s3cr3t" not in text
+
+
+def test_unknown_llm_provider_fails_at_startup(monkeypatch):
+    # A typo must stop the service, not silently pick some other AI
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    with pytest.raises(ValidationError) as error:
+        Settings(_env_file=None)
+    assert "llm_provider" in str(error.value)

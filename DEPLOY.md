@@ -136,8 +136,9 @@ WA_APP_SECRET=<Meta App Secret>
 WA_ACCESS_TOKEN=<Meta permanent system-user token>
 WA_PHONE_NUMBER_ID=<Meta Phone Number ID>
 WA_FAKE_SEND=false
-ANTHROPIC_API_KEY=<Anthropic API key>
-LLM_MODEL=claude-opus-5-5
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=<Gemini API key>
+# or: LLM_PROVIDER=anthropic, ANTHROPIC_API_KEY=<Anthropic API key>, LLM_MODEL=claude-opus-5-5
 ```
 `messaging-api` only, also add: `PORT=8001`
 
@@ -230,7 +231,7 @@ Railway redeploys a service when you save its variables. If one didn't, open it 
 - [ ] The R2 bucket is private (no public access, no r2.dev URL)
 - [ ] Money: `ENV=production` (so `/dev/*` is off), small limits (`MAX_PER_TX_BDT=5000`)
 - [ ] `WA_FAKE_SEND=false` and a permanent Meta system-user token
-- [ ] An Anthropic spend limit is set in console.anthropic.com
+- [ ] A spend limit is set for the AI key (Google Cloud budget for Gemini, or console.anthropic.com)
 - [ ] The handbook demo script (section 10) works on production from a real phone
 
 ## Updating and rolling back

@@ -5,11 +5,13 @@ Safety rules in this file:
 - user_id always comes from our code, never from the model.
 - Every tool input is checked with a Pydantic model before use; bad input -> tool error.
 - The model only ever sees masked text (mask_pii), and only status/reason of a proposal.
+These rules are the same for both AI providers (LLM_PROVIDER=gemini or anthropic).
 """
 
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
@@ -46,7 +48,7 @@ MAX_MSG_ID = 90
 
 money = MoneyClient()
 identity = IdentityClient()
-client: anthropic.AsyncAnthropic | None = None  # created on first use; tests put a fake here
+llm: "AnthropicLLM | GeminiLLM | None" = None  # created on first use; tests put a fake here
 
 
 # --- Tool inputs. extra="ignore": anything else the model sends (e.g. a user_id) is dropped ---
@@ -77,7 +79,7 @@ class RuleArgs(_Args):
 
 CURRENCIES = [c.value for c in Currency]
 # Amounts are strings, never JSON numbers (floats lose cents)
-AMOUNT = {"type": "string", "description": "Decimal number as text, e.g. \"10000\""}
+AMOUNT = {"type": "string", "description": 'Decimal number as text, e.g. "10000"'}
 
 
 def _tool(name: str, description: str, properties: dict) -> dict:
@@ -179,13 +181,13 @@ def _history_key(user_id: uuid.UUID) -> str:
     return f"chat:{user_id}"
 
 
-async def _load_history(user_id: uuid.UUID) -> list[dict]:
-    messages = []
+async def _load_history(user_id: uuid.UUID) -> list[tuple[str, str]]:
+    """Past (user, assistant) turns, oldest first. Stored the same way for every provider."""
+    turns = []
     for raw in reversed(await redis.lrange(_history_key(user_id), 0, HISTORY_TURNS - 1)):
         turn = json.loads(raw)
-        messages.append({"role": "user", "content": turn["user"]})
-        messages.append({"role": "assistant", "content": turn["assistant"]})
-    return messages
+        turns.append((turn["user"], turn["assistant"]))
+    return turns
 
 
 async def _save_turn(user_id: uuid.UUID, user_text: str, reply: str) -> None:
@@ -195,63 +197,183 @@ async def _save_turn(user_id: uuid.UUID, user_text: str, reply: str) -> None:
     await redis.expire(key, HISTORY_TTL)
 
 
-def _get_client() -> anthropic.AsyncAnthropic | None:
-    global client
-    api_key = settings.anthropic_api_key.get_secret_value()
-    if client is None and api_key:
-        client = anthropic.AsyncAnthropic(
-            api_key=api_key, timeout=LLM_TIMEOUT_SECONDS, max_retries=1
+# --- The two AI providers. Both return an Answer, so run_agent works the same for each ---
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    input: dict
+
+
+@dataclass
+class Answer:
+    stop: str  # "tool_use", "end_turn", or why the model stopped (refusal, max_tokens, ...)
+    text: str
+    calls: list[ToolCall]
+    raw: object  # the provider's own answer, sent back as-is in the next request
+
+
+class AnthropicLLM:
+    errors = (anthropic.APIError,)  # API down, timeout, rate limit, ...
+
+    def __init__(self, client):
+        self.client = client
+
+    def start(self, history: list[tuple[str, str]], text: str) -> list[dict]:
+        messages = []
+        for user, assistant in history:
+            messages.append({"role": "user", "content": user})
+            messages.append({"role": "assistant", "content": assistant})
+        return messages + [{"role": "user", "content": text}]
+
+    async def ask(self, messages: list[dict]) -> Answer:
+        response = await self.client.beta.messages.create(
+            model=settings.llm_model,
+            max_tokens=4096,
+            system=SYSTEM,
+            tools=TOOLS,
+            messages=messages,
+            output_config={"effort": "low"},  # short chat replies
+            # If the model declines for policy reasons, the API retries on a fallback model
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
         )
-    return client
+        blocks = response.content
+        calls = [ToolCall(b.id, b.name, b.input) for b in blocks if b.type == "tool_use"]
+        text = "".join(b.text for b in blocks if b.type == "text")
+        return Answer(response.stop_reason, text, calls, blocks)
+
+    def add_tool_round(self, messages: list[dict], answer: Answer, results: list) -> None:
+        messages.append({"role": "assistant", "content": answer.raw})
+        blocks = []
+        for call, content, is_error in results:
+            block = {"type": "tool_result", "tool_use_id": call.id}
+            if is_error:
+                block |= {"content": content, "is_error": True}
+            else:
+                block["content"] = json.dumps(content)
+            blocks.append(block)
+        messages.append({"role": "user", "content": blocks})
 
 
-async def _ask_model(llm: anthropic.AsyncAnthropic, messages: list[dict]):
-    return await llm.beta.messages.create(
-        model=settings.llm_model,
-        max_tokens=4096,
-        system=SYSTEM,
-        tools=TOOLS,
-        messages=messages,
-        output_config={"effort": "low"},  # short chat replies
-        # If the model declines for policy reasons, the API retries on a fallback model
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-    )
+def _gemini_tool(tool: dict) -> dict:
+    """The same tool for Gemini: no additionalProperties, and no schema for no-input tools."""
+    declaration = {"name": tool["name"], "description": tool["description"]}
+    schema = tool["input_schema"]
+    if schema["properties"]:
+        declaration["parameters"] = {k: v for k, v in schema.items() if k != "additionalProperties"}
+    return declaration
+
+
+GEMINI_TOOLS = [{"functionDeclarations": [_gemini_tool(t) for t in TOOLS]}]
+
+
+class GeminiLLM:
+    """Google Gemini generateContent REST API, called with httpx."""
+
+    errors = (httpx.HTTPError, ValueError)  # API down, timeout, 4xx/5xx, answer not JSON
+
+    def __init__(self, api_key: str, transport: httpx.AsyncBaseTransport | None = None):
+        self.http = httpx.AsyncClient(
+            base_url=settings.gemini_base_url,
+            headers={"x-goog-api-key": api_key},  # a header, so the key is never in a URL/log
+            timeout=LLM_TIMEOUT_SECONDS,
+            transport=transport or httpx.AsyncHTTPTransport(retries=1),
+        )
+
+    def start(self, history: list[tuple[str, str]], text: str) -> list[dict]:
+        contents = []
+        for user, assistant in history:
+            contents.append({"role": "user", "parts": [{"text": user}]})
+            contents.append({"role": "model", "parts": [{"text": assistant}]})
+        return contents + [{"role": "user", "parts": [{"text": text}]}]
+
+    async def ask(self, contents: list[dict]) -> Answer:
+        response = await self.http.post(
+            f"/models/{settings.gemini_model}:generateContent",
+            json={
+                "systemInstruction": {"parts": [{"text": SYSTEM}]},
+                "contents": contents,
+                "tools": GEMINI_TOOLS,
+                "generationConfig": {"maxOutputTokens": 4096},
+            },
+        )
+        response.raise_for_status()
+        candidate = (response.json().get("candidates") or [{}])[0]  # none: prompt was blocked
+        parts = (candidate.get("content") or {}).get("parts") or []
+        calls = [
+            ToolCall(f.get("id", ""), f.get("name", ""), f.get("args") or {})
+            for f in (p["functionCall"] for p in parts if "functionCall" in p)
+        ]
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        if calls:
+            stop = "tool_use"
+        elif candidate.get("finishReason") == "STOP":
+            stop = "end_turn"
+        else:  # SAFETY, MAX_TOKENS, blocked prompt, ...
+            stop = candidate.get("finishReason") or "blocked"
+        return Answer(stop, text, calls, {"role": "model", "parts": parts})
+
+    def add_tool_round(self, contents: list[dict], answer: Answer, results: list) -> None:
+        contents.append(answer.raw)  # as received: Gemini needs its thought signatures back
+        parts = []
+        for call, content, is_error in results:
+            reply = {"name": call.name, "response": {"error" if is_error else "result": content}}
+            if call.id:
+                reply["id"] = call.id
+            parts.append({"functionResponse": reply})
+        contents.append({"role": "user", "parts": parts})
+
+
+def _get_llm() -> AnthropicLLM | GeminiLLM | None:
+    """The provider from LLM_PROVIDER, or None if its API key is empty (the agent is off)."""
+    global llm
+    if llm is None and settings.llm_provider == "gemini":
+        api_key = settings.gemini_api_key.get_secret_value()
+        if api_key:
+            llm = GeminiLLM(api_key)
+    elif llm is None:
+        api_key = settings.anthropic_api_key.get_secret_value()
+        if api_key:
+            client = anthropic.AsyncAnthropic(
+                api_key=api_key, timeout=LLM_TIMEOUT_SECONDS, max_retries=1
+            )
+            llm = AnthropicLLM(client)
+    return llm
 
 
 async def run_agent(user_id: uuid.UUID, text: str, msg_id: str) -> str | None:
     """The reply to send, or None if the AI can't answer (the caller shows the menu)."""
-    llm = _get_client()
-    if llm is None:
+    provider = _get_llm()
+    if provider is None:
         return None
 
     masked, _ = mask_pii(text)
-    messages = await _load_history(user_id) + [{"role": "user", "content": masked}]
+    messages = provider.start(await _load_history(user_id), masked)
     calls = 0
     try:
         for _ in range(MAX_TOOL_ROUNDS + 1):
-            response = await _ask_model(llm, messages)
-            if response.stop_reason != "tool_use":
+            answer = await provider.ask(messages)
+            if answer.stop != "tool_use":
                 break
-            messages.append({"role": "assistant", "content": response.content})
             results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
+            for call in answer.calls:
                 key = f"{msg_id[:MAX_MSG_ID]}:{calls}"
-                results.append(await _tool_result(block, user_id, key))
+                results.append(await _tool_result(call, user_id, key))
                 calls += 1
-            messages.append({"role": "user", "content": results})
+            provider.add_tool_round(messages, answer, results)
         else:
             return None  # still calling tools after MAX_TOOL_ROUNDS rounds
-    except anthropic.APIError as e:  # API down, timeout, rate limit, ...
+    except provider.errors as e:
         log.warning("LLM call failed (%s), showing the menu", type(e).__name__)
         return None
 
-    if response.stop_reason != "end_turn":  # refusal, max_tokens, ...
-        log.warning("LLM stopped with %s, showing the menu", response.stop_reason)
+    if answer.stop != "end_turn":  # refusal, max_tokens, ...
+        log.warning("LLM stopped with %s, showing the menu", answer.stop)
         return None
-    reply = "".join(b.text for b in response.content if b.type == "text").strip()
+    reply = answer.text.strip()
     if not reply:
         return None
     reply = reply[:MAX_REPLY_CHARS]
@@ -259,14 +381,14 @@ async def run_agent(user_id: uuid.UUID, text: str, msg_id: str) -> str | None:
     return reply
 
 
-async def _tool_result(block, user_id: uuid.UUID, key: str) -> dict:
+async def _tool_result(call: ToolCall, user_id: uuid.UUID, key: str) -> tuple:
+    """(call, result, is_error). The provider turns it into its own message format."""
     try:
-        content = await run_tool(block.name, block.input, user_id, key)
-        return {"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(content)}
+        return call, await run_tool(call.name, call.input, user_id, key), False
     except (ValueError, TypeError) as e:  # includes Pydantic's ValidationError
-        log.info("tool %s: invalid input (%s)", block.name, type(e).__name__)
-        error = f"Invalid input for {block.name}. Check the values and try again."
+        log.info("tool %s: invalid input (%s)", call.name, type(e).__name__)
+        error = f"Invalid input for {call.name}. Check the values and try again."
     except (ServiceUnavailable, httpx.HTTPStatusError) as e:
-        log.warning("tool %s: service error (%s)", block.name, type(e).__name__)
+        log.warning("tool %s: service error (%s)", call.name, type(e).__name__)
         error = "That service is not available right now. Tell the student to try again later."
-    return {"type": "tool_result", "tool_use_id": block.id, "content": error, "is_error": True}
+    return call, error, True

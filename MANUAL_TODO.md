@@ -114,10 +114,12 @@ type your number → the message arrives. Error `131030` = your number isn't on 
 terminal shows `queued message from ****1234`. A new ngrok URL (after restarting ngrok)
 means repeating step 3.
 
-### ☐ A8. Anthropic API key (the AI)
-**Do:** console.anthropic.com → sign in → **API Keys** → **Create Key** → copy it into
-`services\messaging\.env` as `ANTHROPIC_API_KEY=<key>`. Then **Billing / Limits** → set a
-small monthly spend limit.
+### ☐ A8. AI API key (Gemini by default, or Anthropic)
+**Do:** `LLM_PROVIDER=gemini` (default): aistudio.google.com → **Get API key** → **Create API
+key** → copy it into `services\messaging\.env` as `GEMINI_API_KEY=<key>`, and set a small
+budget/spend cap for that Google Cloud project.
+Or `LLM_PROVIDER=anthropic`: console.anthropic.com → **API Keys** → **Create Key** →
+`ANTHROPIC_API_KEY=<key>`, then **Billing / Limits** → set a small monthly spend limit.
 **Why:** without a key the AI is off and users only get the 3-button menu (FREEZE still works).
 **Check:** after A9, "what's the taka to rupiah rate?" gets an answer with the rate.
 

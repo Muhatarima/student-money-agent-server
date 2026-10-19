@@ -17,8 +17,13 @@ x-messaging: &messaging
     IDENTITY_URL: http://identity-api:8003
     WA_FAKE_SEND: "true"  # never sends real WhatsApp messages
     WA_FAKE_SEND_URL: http://fake-whatsapp:8009/fake-whatsapp/send
+    # The scripted fake AI, not a real API (fake_llm.py speaks Gemini and Anthropic)
+    LLM_PROVIDER: gemini
+    GEMINI_API_KEY: e2e-fake-key
+    GEMINI_BASE_URL: http://fake-llm:8010/v1beta
+    # To try the Anthropic path instead: LLM_PROVIDER: anthropic
     ANTHROPIC_API_KEY: e2e-fake-key
-    ANTHROPIC_BASE_URL: http://fake-llm:8010  # the scripted fake, not the real API
+    ANTHROPIC_BASE_URL: http://fake-llm:8010
   depends_on:
     identity-api: { condition: service_healthy }
     money-api: { condition: service_healthy }
@@ -116,7 +121,7 @@ services:
     ports: ["18009:8009"]
     depends_on: {}
 
-  # Fake Anthropic API with scripted answers (see fake_llm.py)
+  # Fake AI API (Gemini + Anthropic formats) with scripted answers (see fake_llm.py)
   fake-llm:
     <<: *messaging
     command: ["uvicorn", "fake_llm:app", "--app-dir", "/srv/e2e", "--host", "0.0.0.0", "--port", "8010"]

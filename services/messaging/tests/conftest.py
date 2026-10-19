@@ -8,6 +8,9 @@ os.environ["PHONE_HASH_KEY"] = "test-phone-hash-key"
 os.environ["INTERNAL_API_KEY"] = "test-internal-key"
 os.environ["MONEY_URL"] = "http://money.test"
 os.environ["IDENTITY_URL"] = "http://identity.test"
+# Never use a real AI key from .env: tests must not call a real AI
+os.environ["ANTHROPIC_API_KEY"] = ""
+os.environ["GEMINI_API_KEY"] = ""
 
 import fakeredis  # noqa: E402
 import pytest  # noqa: E402

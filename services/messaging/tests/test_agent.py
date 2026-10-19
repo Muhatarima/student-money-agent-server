@@ -1,4 +1,8 @@
-"""The agent with a FAKE LLM: tests decide what the "model" answers. No network, no API key."""
+"""The agent with a FAKE LLM: tests decide what the "model" answers. No network, no API key.
+
+Every test that uses the `llm` fixture runs twice: once with a fake Anthropic API and once with
+a fake Gemini API, so both providers get the same safety checks.
+"""
 
 import json
 import uuid
@@ -12,43 +16,126 @@ from pydantic import SecretStr
 
 from app import agent
 from app.clients import IdentityClient, MoneyClient
-from app.config import settings
+from app.config import Settings, settings
 from tests.mocks import mock_identity, mock_money
 
 USER = uuid.uuid4()
 MSG_ID = "wamid.AGENT1"
+GEMINI_KEY = "test-gemini-key"
+
+# What the fake "model" does next. The same script works for both providers.
+API_DOWN = {"down": True}
+STOPPED = {"stopped": True}  # refusal / safety block
 
 
-def text(reply: str):
-    return SimpleNamespace(
-        stop_reason="end_turn", content=[SimpleNamespace(type="text", text=reply)]
-    )
+def text(reply: str) -> dict:
+    return {"text": reply}
 
 
-def tool(name: str, **tool_input):
-    block = SimpleNamespace(
-        type="tool_use", id=f"toolu_{uuid.uuid4().hex[:8]}", name=name, input=tool_input
-    )
-    return SimpleNamespace(stop_reason="tool_use", content=[block])
+def tool(name: str, **tool_input) -> dict:
+    return {"tool": name, "input": tool_input}
 
 
-class FakeLLM:
-    """Answers with the scripted responses, in order, and records every request."""
+class FakeAnthropic:
+    """Looks like anthropic.AsyncAnthropic. Answers with the script, records every request."""
 
-    def __init__(self, *responses):
-        self.responses = list(responses)
+    def __init__(self, *script):
+        self.script = list(script)
         self.requests = []
         self.beta = SimpleNamespace(messages=SimpleNamespace(create=self.create))
+        self.expected_model = settings.llm_model
+
+    def provider(self):
+        return agent.AnthropicLLM(self)
 
     async def create(self, **request):
         self.requests.append(json.loads(json.dumps(request, default=vars)))  # snapshot
-        answer = self.responses.pop(0)
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
+        step = self.script.pop(0)
+        if step is API_DOWN:
+            raise anthropic.APIConnectionError(request=httpx.Request("POST", "https://api.test"))
+        if step is STOPPED:
+            return SimpleNamespace(stop_reason="refusal", content=[])
+        if "text" in step:
+            block = SimpleNamespace(type="text", text=step["text"])
+            return SimpleNamespace(stop_reason="end_turn", content=[block])
+        block = SimpleNamespace(
+            type="tool_use",
+            id=f"toolu_{uuid.uuid4().hex[:8]}",
+            name=step["tool"],
+            input=step["input"],
+        )
+        return SimpleNamespace(stop_reason="tool_use", content=[block])
 
-    def tool_results(self, request_index: int) -> list[dict]:
-        return self.requests[request_index]["messages"][-1]["content"]
+    # --- The same views for both fakes, so the tests don't care which provider it is ---
+
+    def model(self, i: int) -> str:
+        return self.requests[i]["model"]
+
+    def tool_properties(self, i: int) -> dict:
+        return {t["name"]: t["input_schema"]["properties"] for t in self.requests[i]["tools"]}
+
+    def chat(self, i: int) -> list[tuple[str, str]]:
+        return [(m["role"], m["content"]) for m in self.requests[i]["messages"]]
+
+    def tool_results(self, i: int) -> list[dict]:
+        blocks = self.requests[i]["messages"][-1]["content"]
+        return [{"content": b["content"], "is_error": b.get("is_error", False)} for b in blocks]
+
+
+class FakeGemini:
+    """A fake Gemini REST API (httpx MockTransport). Answers with the script."""
+
+    def __init__(self, *script):
+        self.script = list(script)
+        self.requests = []
+        self.expected_model = settings.gemini_model
+
+    def provider(self):
+        return agent.GeminiLLM(GEMINI_KEY, transport=httpx.MockTransport(self.handle))
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.requests.append({"url": str(request.url), "headers": request.headers, "body": body})
+        step = self.script.pop(0)
+        if isinstance(step, httpx.Response):  # a raw answer for Gemini-only tests
+            return step
+        if step is API_DOWN:
+            raise httpx.ConnectError("down", request=request)
+        if step is STOPPED:
+            return httpx.Response(200, json={"candidates": [{"finishReason": "SAFETY"}]})
+        if "text" in step:
+            parts = [{"text": step["text"]}]
+        else:
+            call = {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "name": step["tool"],
+                "args": step["input"],
+            }
+            parts = [{"functionCall": call, "thoughtSignature": "sig-1"}]
+        candidate = {"content": {"role": "model", "parts": parts}, "finishReason": "STOP"}
+        return httpx.Response(200, json={"candidates": [candidate]})
+
+    def model(self, i: int) -> str:
+        return self.requests[i]["url"].split("/models/")[1].split(":")[0]
+
+    def tool_properties(self, i: int) -> dict:
+        declarations = self.requests[i]["body"]["tools"][0]["functionDeclarations"]
+        return {d["name"]: d.get("parameters", {}).get("properties", {}) for d in declarations}
+
+    def chat(self, i: int) -> list[tuple[str, str]]:
+        roles = {"user": "user", "model": "assistant"}
+        contents = self.requests[i]["body"]["contents"]
+        return [(roles[c["role"]], c["parts"][0]["text"]) for c in contents]
+
+    def tool_results(self, i: int) -> list[dict]:
+        results = []
+        for part in self.requests[i]["body"]["contents"][-1]["parts"]:
+            response = part["functionResponse"]["response"]
+            if "error" in response:
+                results.append({"content": response["error"], "is_error": True})
+            else:
+                results.append({"content": json.dumps(response["result"]), "is_error": False})
+        return results
 
 
 class Spy:
@@ -76,11 +163,23 @@ def clients(monkeypatch):
     return SimpleNamespace(money=money, identity=identity)
 
 
+@pytest.fixture(params=["anthropic", "gemini"])
+def llm(request, monkeypatch):
+    fake_class = FakeAnthropic if request.param == "anthropic" else FakeGemini
+
+    def install(*script):
+        fake = fake_class(*script)
+        monkeypatch.setattr(agent, "llm", fake.provider())
+        return fake
+
+    return install
+
+
 @pytest.fixture
-def llm(monkeypatch):
-    def install(*responses):
-        fake = FakeLLM(*responses)
-        monkeypatch.setattr(agent, "client", fake)
+def gemini(monkeypatch):
+    def install(*script):
+        fake = FakeGemini(*script)
+        monkeypatch.setattr(agent, "llm", fake.provider())
         return fake
 
     return install
@@ -90,28 +189,55 @@ async def run(message="hi"):
     return await agent.run_agent(USER, message, MSG_ID)
 
 
-# --- Basics ---
+# --- Choosing the provider (LLM_PROVIDER) ---
 
 
-async def test_no_api_key_means_no_agent(monkeypatch):
-    monkeypatch.setattr(agent, "client", None)
+def test_gemini_is_the_default_provider():
+    assert Settings.model_fields["llm_provider"].default == "gemini"
+
+
+@pytest.mark.parametrize(
+    "provider, key_setting, expected",
+    [
+        ("gemini", "gemini_api_key", agent.GeminiLLM),
+        ("anthropic", "anthropic_api_key", agent.AnthropicLLM),
+    ],
+)
+def test_provider_comes_from_the_setting(monkeypatch, provider, key_setting, expected):
+    monkeypatch.setattr(agent, "llm", None)
+    monkeypatch.setattr(settings, "llm_provider", provider)
+    monkeypatch.setattr(settings, key_setting, SecretStr("some-key"))
+    assert isinstance(agent._get_llm(), expected)
+
+
+@pytest.mark.parametrize(
+    "provider, other_key", [("gemini", "anthropic_api_key"), ("anthropic", "gemini_api_key")]
+)
+async def test_no_key_for_the_chosen_provider_means_no_agent(monkeypatch, provider, other_key):
+    # Only the OTHER provider has a key: the agent stays off, it never switches by itself
+    monkeypatch.setattr(agent, "llm", None)
+    monkeypatch.setattr(settings, "llm_provider", provider)
     monkeypatch.setattr(settings, "anthropic_api_key", SecretStr(""))
+    monkeypatch.setattr(settings, "gemini_api_key", SecretStr(""))
+    monkeypatch.setattr(settings, other_key, SecretStr("some-key"))
     assert await run() is None
+
+
+# --- Basics ---
 
 
 async def test_plain_reply(llm):
     fake = llm(text("Hello! How can I help?"))
     assert await run() == "Hello! How can I help?"
-    request = fake.requests[0]
-    assert request["model"] == settings.llm_model
-    assert request["messages"] == [{"role": "user", "content": "hi"}]
+    assert fake.model(0) == fake.expected_model
+    assert fake.chat(0) == [("user", "hi")]
 
 
 async def test_offered_tools_can_only_read_propose_or_freeze(llm):
     fake = llm(text("ok"))
     await run()
-    names = {t["name"] for t in fake.requests[0]["tools"]}
-    assert names == {
+    tools = fake.tool_properties(0)
+    assert set(tools) == {
         "get_rate",
         "get_balance",
         "list_rules",
@@ -120,14 +246,14 @@ async def test_offered_tools_can_only_read_propose_or_freeze(llm):
         "freeze_account",
     }
     # No tool takes a user_id: that always comes from our code
-    for t in fake.requests[0]["tools"]:
-        assert "user_id" not in t["input_schema"]["properties"]
+    for properties in tools.values():
+        assert "user_id" not in properties
 
 
 async def test_model_only_sees_masked_text(llm):
     fake = llm(text("Please never share card numbers."))
     await run("my card is 4111 1111 1111 1111 and email a@b.com")
-    seen = fake.requests[0]["messages"][-1]["content"]
+    seen = fake.chat(0)[-1][1]
     assert "4111" not in seen and "a@b.com" not in seen
     assert "<CARD_REMOVED>" in seen
 
@@ -289,12 +415,12 @@ async def test_freeze_tool_freezes_both(llm, clients):
 
 
 async def test_api_error_returns_none(llm):
-    llm(anthropic.APIConnectionError(request=httpx.Request("POST", "https://api.test")))
+    llm(API_DOWN)
     assert await run() is None
 
 
 async def test_refusal_returns_none(llm):
-    llm(SimpleNamespace(stop_reason="refusal", content=[]))
+    llm(STOPPED)
     assert await run() is None
 
 
@@ -311,10 +437,10 @@ async def test_history_is_saved_and_sent_next_time(llm, redis):
     await run("first question")
     fake = llm(text("second answer"))
     await run("second question")
-    assert fake.requests[0]["messages"] == [
-        {"role": "user", "content": "first question"},
-        {"role": "assistant", "content": "first answer"},
-        {"role": "user", "content": "second question"},
+    assert fake.chat(0) == [
+        ("user", "first question"),
+        ("assistant", "first answer"),
+        ("user", "second question"),
     ]
     assert 0 < await redis.ttl(f"chat:{USER}") <= agent.HISTORY_TTL
 
@@ -330,3 +456,47 @@ async def test_history_is_stored_masked(llm, redis):
     llm(text("ok"))
     await run("my email is a@b.com")
     assert "a@b.com" not in json.dumps(await redis.lrange(f"chat:{USER}", 0, -1))
+
+
+# --- Gemini only: its own wire format ---
+
+
+async def test_gemini_key_is_sent_in_a_header_not_the_url(gemini):
+    fake = gemini(text("ok"))
+    await run()
+    assert fake.requests[0]["headers"]["x-goog-api-key"] == GEMINI_KEY
+    assert GEMINI_KEY not in fake.requests[0]["url"]
+
+
+async def test_gemini_tool_schemas_are_ones_gemini_accepts(gemini):
+    fake = gemini(text("ok"))
+    await run()
+    declarations = fake.requests[0]["body"]["tools"][0]["functionDeclarations"]
+    assert "additionalProperties" not in json.dumps(declarations)
+    no_input = {d["name"] for d in declarations if "parameters" not in d}
+    assert no_input == {"get_balance", "list_rules", "freeze_account"}
+
+
+async def test_gemini_gets_its_turn_back_with_the_thought_signature(gemini):
+    fake = gemini(tool("get_balance"), text("ok"))
+    await run()
+    model_turn, results = fake.requests[1]["body"]["contents"][-2:]
+    assert model_turn["role"] == "model"
+    assert model_turn["parts"][0]["thoughtSignature"] == "sig-1"
+    call_id = model_turn["parts"][0]["functionCall"]["id"]
+    assert results["parts"][0]["functionResponse"]["id"] == call_id
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(200, json={"promptFeedback": {"blockReason": "SAFETY"}}),  # blocked
+        httpx.Response(200, json={"candidates": [{"finishReason": "MAX_TOKENS"}]}),
+        httpx.Response(429, json={"error": {"message": "quota"}}),
+        httpx.Response(500, text="oops"),
+        httpx.Response(200, text="not json"),
+    ],
+)
+async def test_gemini_bad_answers_return_none(gemini, answer):
+    gemini(answer)
+    assert await run() is None

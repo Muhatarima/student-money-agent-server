@@ -1,4 +1,6 @@
+import logging
 import uuid
+from contextlib import asynccontextmanager
 from decimal import Decimal
 
 from contracts.models import (
@@ -13,7 +15,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import proposals
+from app import background, jobs, proposals
 from app.auth import require_internal_key
 from app.config import settings
 from app.db import SessionLocal, get_session
@@ -25,10 +27,22 @@ from app.providers.mock import MockProvider
 from app.redis_client import redis
 from app.rules_engine import freeze_user, index_rule
 
-app = FastAPI(title="Money Core")
-internal = [Depends(require_internal_key)]
 # One provider for the whole process (the mock keeps its records in memory)
 provider = MockProvider()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not settings.run_jobs_in_api:
+        yield
+        return
+    logging.basicConfig(level=logging.INFO)  # like python -m app.jobs
+    async with background.running({"money-jobs": lambda: jobs.main(provider)}):
+        yield
+
+
+app = FastAPI(title="Money Core", lifespan=lifespan)
+internal = [Depends(require_internal_key)]
 new_session = SessionLocal
 
 

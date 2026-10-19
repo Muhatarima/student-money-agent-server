@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -5,7 +6,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
-from app import approvals, passkeys, signatures, users, vault
+from app import approvals, background, jobs, passkeys, signatures, users, vault
 from app.config import settings
 from app.db import engine
 from app.logs import setup_logging
@@ -22,7 +23,17 @@ CSP = (
 
 setup_logging()
 
-app = FastAPI(title="Identity")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not settings.run_jobs_in_api:
+        yield
+        return
+    async with background.running({"identity-jobs": jobs.main}):
+        yield
+
+
+app = FastAPI(title="Identity", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 app.include_router(users.router)
 app.include_router(passkeys.router)

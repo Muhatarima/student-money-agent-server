@@ -2,10 +2,12 @@ import hashlib
 import hmac
 import json
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from app import background, notifier, worker
 from app.config import settings
 from app.dedupe import forget, is_duplicate
 from app.logs import setup_logging
@@ -16,7 +18,17 @@ from app.security import mask_phone
 setup_logging()
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="Student Money Agent")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not settings.run_jobs_in_api:
+        yield
+        return
+    async with background.running({"worker": worker.main, "notifier": notifier.main}):
+        yield
+
+
+app = FastAPI(title="Student Money Agent", lifespan=lifespan)
 
 MAX_BODY_BYTES = 1_000_000  # real WhatsApp webhooks are a few KB
 

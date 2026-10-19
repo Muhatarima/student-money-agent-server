@@ -99,8 +99,9 @@ async def every(seconds: int, job) -> None:
         await asyncio.sleep(seconds)
 
 
-async def main() -> None:
-    provider = MockProvider()
+async def main(provider: Provider | None = None) -> None:
+    # Inside money-api (RUN_JOBS_IN_API) we get the API's provider: one provider per process
+    provider = provider or MockProvider()
     async with SessionLocal() as session:
         await rebuild_index(session, redis)
 

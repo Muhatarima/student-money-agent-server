@@ -16,6 +16,7 @@ os.environ["RP_ID"] = "localhost"
 os.environ["FERNET_KEY"] = Fernet.generate_key().decode()
 os.environ["VAULT_MASTER_KEY"] = Fernet.generate_key().decode()
 os.environ["SESSION_SECRET"] = "test-session-secret"
+os.environ["RUN_JOBS_IN_API"] = "false"  # tests start jobs themselves
 
 import fakeredis  # noqa: E402
 import pytest  # noqa: E402

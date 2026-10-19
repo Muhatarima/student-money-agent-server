@@ -17,6 +17,14 @@ Nothing here has been done for you: deploying is a human-only step (see `MANUAL_
 
 Plus two Postgres databases (`pg-money`, `pg-identity`) and one Redis, all from Railway.
 
+> **Small plan (5 services per project)?** Use this layout instead: one Postgres (`pg-money`)
+> with two databases `money` and `identity`, plus `Redis`, `money-api`, `identity-api`,
+> `messaging-api`. Set `RUN_JOBS_IN_API=true` on the three `-api` services: each one then also
+> runs its jobs (money: rates/rules/reconcile; identity: purge; messaging: worker + notifier),
+> and a crashed job restarts by itself. Skip the four jobs/worker/notifier services, and point
+> identity's `DATABASE_URL` at `.../identity` on `pg-money`. Never set `RUN_JOBS_IN_API=true`
+> AND run the separate jobs service, or every job runs twice.
+
 > ⚠️ Money still moves **only** through the fake `MockProvider`. This deployment is a demo.
 > Real money needs the "Before REAL money" list in the handbook (section 11).
 
@@ -154,7 +162,7 @@ MAX_PER_DAY_BDT=10000
 MOCK_FAILURE_RATE=0
 MOCK_TIMEOUT_RATE=0
 ```
-`money-api` only, also add: `PORT=8002` and `HOST=::`
+`money-api` only, also add: `PORT=8002` and `HOST=0.0.0.0`
 
 - `ENV=production` turns off `/dev/seed` (no test money in production).
 - The `+asyncpg` part is required: Railway's own `DATABASE_URL` starts with `postgresql://`,
@@ -180,14 +188,14 @@ S3_BUCKET=student-money-vault
 S3_ACCESS_KEY=<from step 2>
 S3_SECRET_KEY=<from step 2>
 ```
-`identity-api` only, also add: `PORT=8003` and `HOST=::`
+`identity-api` only, also add: `PORT=8003` and `HOST=0.0.0.0`
 
 - `PUBLIC_BASE_URL` has no `/` at the end. It must match the browser address exactly.
 - `identity-jobs` needs the S3 values too: it deletes expired documents from R2.
 
-**Why `PORT` and `HOST=::`?** Other services call `money-api` and `identity-api` on Railway's
-private network at a fixed port, and that network uses IPv6. `HOST=::` makes the server
-listen there. (The messaging services are never called by other services.)
+**Why `PORT` and `HOST=0.0.0.0`?** Other services call `money-api` and `identity-api` on Railway's
+private network at a fixed port. That network is IPv4 & IPv6 now, and Railway's healthcheck
+uses IPv4: with `HOST=::` the healthcheck fails. (Messaging is never called by other services.)
 
 ## Step 7: Deploy, in this order
 
@@ -196,7 +204,7 @@ Railway redeploys a service when you save its variables. If one didn't, open it 
 
 1. `money-api` and `identity-api` first. Open each → **Deployments** → the newest →
    **View logs**. You must see `Running upgrade ...` lines (the migrations) and then
-   `Uvicorn running on http://[::]:800x`.
+   `Uvicorn running on http://0.0.0.0:800x`.
 2. Then `money-jobs` and `identity-jobs` (they need the tables from step 1).
 3. Then `messaging-api`, `messaging-worker`, `messaging-notifier`.
 
@@ -250,7 +258,7 @@ Railway redeploys a service when you save its variables. If one didn't, open it 
 |---|---|
 | A service crashes at start with `Field required` | That variable is missing on that service (step 6) |
 | `asyncpg` / URL error | `DATABASE_URL` must start with `postgresql+asyncpg://` |
-| Messaging says "Sorry, something went wrong" for every message | `MONEY_URL` / `IDENTITY_URL` wrong, or `money-api` / `identity-api` lack `PORT` + `HOST=::` |
+| Messaging says "Sorry, something went wrong" for every message | `MONEY_URL` / `IDENTITY_URL` wrong, or `money-api` / `identity-api` lack `PORT` + `HOST=0.0.0.0` |
 | 401 between services | `INTERNAL_API_KEY` differs: all 7 must use `${{shared.INTERNAL_API_KEY}}` |
 | User "not found" after linking | `PHONE_HASH_KEY` differs between services (use the shared one) |
 | Meta "Verify and save" fails | URL must end with `/webhook`; verify token must match exactly |

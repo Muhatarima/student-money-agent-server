@@ -30,7 +30,7 @@ x-messaging: &messaging
 
 x-money: &money
   build: { context: ../.., dockerfile: services/money/Dockerfile }
-  environment:
+  environment: &money-env
     <<: *internal
     ENV: dev  # turns on POST /dev/seed (test money for the demo user)
     DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/money
@@ -40,7 +40,7 @@ x-money: &money
 
 x-identity: &identity
   build: { context: ../.., dockerfile: services/identity/Dockerfile }
-  environment:
+  environment: &identity-env
     <<: *internal
     ENV: dev
     DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/identity
@@ -51,7 +51,7 @@ x-identity: &identity
     VAULT_MASTER_KEY: 1MD7xvUxr97fbcKPoY6N08VkzT4BBVlXjpKLHfEX0SU=
     SESSION_SECRET: e2e-session-secret
     STORAGE_BACKEND: local
-  volumes: ["vault:/srv/services/identity/vault_local"]  # api and jobs share the files
+  volumes: ["vault:/srv/services/identity/vault_local"]
 
 x-health: &health
   interval: 2s
@@ -69,8 +69,11 @@ services:
     image: redis:7
     healthcheck: { <<: *health, test: ["CMD", "redis-cli", "ping"] }
 
+  # Like Railway: each api also runs its background jobs (RUN_JOBS_IN_API), so there are
+  # no separate jobs / worker / notifier containers
   money-api:
     <<: *money
+    environment: { <<: *money-env, RUN_JOBS_IN_API: "true" }
     ports: ["18002:8002"]
     depends_on:
       postgres: { condition: service_healthy }
@@ -79,13 +82,9 @@ services:
       <<: *health
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8002/health')"]
 
-  money-jobs:
-    <<: *money
-    command: ["python", "-m", "app.jobs"]
-    depends_on: { money-api: { condition: service_healthy } }  # migrations ran
-
   identity-api:
     <<: *identity
+    environment: { <<: *identity-env, RUN_JOBS_IN_API: "true" }
     ports: ["18003:8003"]
     depends_on:
       postgres: { condition: service_healthy }
@@ -94,25 +93,13 @@ services:
       <<: *health
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8003/health')"]
 
-  identity-jobs:
-    <<: *identity
-    command: ["python", "-m", "app.jobs"]
-    depends_on: { identity-api: { condition: service_healthy } }
-
   messaging-api:
     <<: *messaging
+    environment: { <<: *messaging-env, RUN_JOBS_IN_API: "true" }
     ports: ["18001:8001"]
     healthcheck:
       <<: *health
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8001/health')"]
-
-  messaging-worker:
-    <<: *messaging
-    command: ["python", "-m", "app.worker"]
-
-  messaging-notifier:
-    <<: *messaging
-    command: ["python", "-m", "app.notifier"]
 
   # Fake WhatsApp: catches every message the worker and notifier "send"
   fake-whatsapp:

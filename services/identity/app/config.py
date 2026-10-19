@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     s3_access_key: SecretStr = SecretStr("")
     s3_secret_key: SecretStr = SecretStr("")
 
+    # true = this API also runs the background jobs (see app/background.py). Keep it false
+    # when the jobs run as their own process, or every job runs twice.
+    run_jobs_in_api: bool = False
+
     @property
     def is_production(self) -> bool:
         return self.env == "production"

@@ -11,6 +11,7 @@ os.environ["IDENTITY_URL"] = "http://identity.test"
 # Never use a real AI key from .env: tests must not call a real AI
 os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ["GEMINI_API_KEY"] = ""
+os.environ["RUN_JOBS_IN_API"] = "false"  # tests start jobs themselves
 
 import fakeredis  # noqa: E402
 import pytest  # noqa: E402

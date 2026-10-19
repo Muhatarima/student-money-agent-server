@@ -94,7 +94,7 @@ def test_demo_script():
 
     # 8. Purge, as if 8 days had passed (documents are kept 7 days): the file is gone
     run_in(
-        "identity-jobs",
+        "identity-api",
         "python",
         "-c",
         "import asyncio; from datetime import UTC, datetime, timedelta; "

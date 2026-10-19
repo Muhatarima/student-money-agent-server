@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     mock_timeout_rate: float = 0.1
     rate_stale_seconds: int = 120
 
+    # true = this API also runs the background jobs (see app/background.py). Keep it false
+    # when the jobs run as their own process, or every job runs twice.
+    run_jobs_in_api: bool = False
+
     @property
     def is_production(self) -> bool:
         return self.env == "production"

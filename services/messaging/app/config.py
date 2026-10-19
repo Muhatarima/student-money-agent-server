@@ -33,5 +33,9 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.8-flash"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
 
+    # true = this API also runs the background jobs (see app/background.py). Keep it false
+    # when the jobs run as their own process, or every job runs twice.
+    run_jobs_in_api: bool = False
+
 
 settings = Settings()

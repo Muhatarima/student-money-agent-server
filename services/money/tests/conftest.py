@@ -8,6 +8,7 @@ os.environ["REDIS_URL"] = "redis://localhost:6379/15"
 os.environ["INTERNAL_API_KEY"] = "test-key"
 os.environ["IDENTITY_URL"] = "http://identity.test"
 os.environ["ENV"] = "test"
+os.environ["RUN_JOBS_IN_API"] = "false"  # tests start jobs themselves
 
 from collections.abc import AsyncIterator  # noqa: E402
 from pathlib import Path  # noqa: E402
